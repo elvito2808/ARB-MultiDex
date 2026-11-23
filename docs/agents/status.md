@@ -9,7 +9,7 @@
 | main | `0848e8fe7c5990bedcd5ed90c51d737a0fb1aafc` | کامیت اولیه |
 | elvito2808-patch-1 | `99180c4afda61696cbfbc067014205208e41eb31` | مبنای اسناد نیازمندی |
 | agent-governance | `9acb21a38c4cacbef8af061ab86a09f06913dec2` | قواعد نقش‌ها، مسئولیت‌ها، تحویل و تصمیمات |
-| agent0-development-readiness | `9bf669ce0c03f31d54221abadc2fbf09af479583` | رجیستر Agent 0؛ به‌روزرسانی بعدی روی همین شاخه |
+| agent0-development-readiness | `056a3106b068c3ea00b1eca4cc1d16b4b22cf8be` | رجیستر Agent 0؛ آخرین ثبت وضعیت بسته‌ها |
 | sim-01-quote-contract | `c63f0c57740013d297c2af819e2829c8ea4f1e87` | SIM-01 / Revision 1؛ بازبینی CHANGES_REQUIRED |
 | sim-01-s2-review-1 | `0183514ed21f1ceb5130cc10b76a6036eb5b9190` | گزارش S2 برای SIM-01 / Review-1 |
 | sim-01-quote-contract-r2 | `4c8f77f9ade041bc3a8051758817c9a6aea79adf` | SIM-01 / Revision 2؛ آماده بازبینی مستقل S2 |
