@@ -9,11 +9,12 @@
 | main | `0848e8fe7c5990bedcd5ed90c51d737a0fb1aafc` | کامیت اولیه |
 | elvito2808-patch-1 | `99180c4afda61696cbfbc067014205208e41eb31` | مبنای اسناد نیازمندی |
 | agent-governance | `9acb21a38c4cacbef8af061ab86a09f06913dec2` | قواعد نقش‌ها، مسئولیت‌ها، تحویل و تصمیمات |
-| agent0-development-readiness | `7d02ad18378e40622ee72b4edeef1b1c197d352e` | SHA شاخه پیش از ثبت این نسخه از رجیستر |
+| agent0-development-readiness | `afeb95a07956e3b3848a18676240a3b18def267b` | SHA شاخه پیش از ثبت این نسخه از رجیستر |
 | sim-01-quote-contract | `c63f0c57740013d297c2af819e2829c8ea4f1e87` | SIM-01 / Revision 1؛ بازبینی CHANGES_REQUIRED |
 | sim-01-s2-review-1 | `0183514ed21f1ceb5130cc10b76a6036eb5b9190` | گزارش S2 برای SIM-01 / Review-1 |
-| sim-01-quote-contract-r2 | `4c8f77f9ade041bc3a8051758817c9a6aea79adf` | SIM-01 / Revision 2؛ آماده بازبینی مستقل S2 |
-| sim-01-s2-review-2 | `4c8f77f9ade041bc3a8051758817c9a6aea79adf` | شاخه مستقل بازبینی SIM-01 Revision 2 |
+| sim-01-quote-contract-r2 | `4c8f77f9ade041bc3a8051758817c9a6aea79adf` | SIM-01 / Revision 2؛ نتیجه CHANGES_REQUIRED از S2 Review-2 |
+| sim-01-quote-contract-r3 | `4c8f77f9ade041bc3a8051758817c9a6aea79adf` | SIM-01 / Revision 3؛ شاخه اصلاحی ایجادشده بر مبنای Revision 2 |
+| sim-01-s2-review-2 | `523715e06f6a01933895aae65e896d32e4cfa48e` | گزارش مستقل S2 Review-2؛ نتیجه CHANGES_REQUIRED |
 | dex-02-01-hedera-discovery | `38be85dd629ca55e34dd165440e169e0c95215a7` | DEX-02-01 / Revision 1؛ تحقیق کشف بازار پذیرفته‌شده در دامنه غیرعملیاتی |
 | dex-02-01-s2-review-1 | `07402d2f23731ff0013720bebfe7e893ac5e4cbc` | گزارش بازبینی فنی S2 |
 | dex-02-01-s5-evidence-review-1 | `67d4caa64e0a2b6cc08ffd62d38d2b240dd27966` | گزارش بازبینی شواهد و مرز امنیتی S5 |
@@ -23,7 +24,8 @@
 | کار | مسئول | بازبین / مشورت | وضعیت و اقدام بعدی |
 | --- | --- | --- | --- |
 | SIM-01 / Revision 1 | S1 | S2 مستقل؛ S5 مشورت | **CHANGES_REQUIRED** در SHA `c63f0c57740013d297c2af819e2829c8ea4f1e87`. با Revision 2 جایگزین شده؛ پذیرش Revision 1 منتفی است. |
-| SIM-01 / Revision 2 | S1 | S2 مستقل؛ S5 مشورت | **READY_FOR_REVIEW** در SHA `4c8f77f9ade041bc3a8051758817c9a6aea79adf`. یک فایل مجاز تغییر کرده است. S1 گزارش ۳۷/۳۷ assertion آفلاین و `git diff --check` موفق داده است. Agent 0 تغییر و محتوای سند را تطبیق داده، اما آزمون‌ها در مخزن به‌صورت اسکریپت مستقل قابل اجرای مجدد تحویل نشده‌اند. S2 باید شش یافته Review-1، منطق قرارداد، مثال‌های عددی و کفایت شواهد آزمون را روی همین SHA مستقل بررسی کند. شاخه بازبینی `sim-01-s2-review-2` آماده است. |
+| SIM-01 / Revision 2 | S1 | S2 مستقل؛ S5 مشورت | **CHANGES_REQUIRED** در SHA `4c8f77f9ade041bc3a8051758817c9a6aea79adf` طبق گزارش S2 به SHA `523715e06f6a01933895aae65e896d32e4cfa48e`. یافته B1: مثال mixed-mode انتظار `INCOMPARABLE_QUOTES` دارد، درحالی‌که LIVE در این مرحله از اعتبارسنجی درخواست با `INVALID_QUOTE` رد می‌شود. S2 گزارش ۹۳/۹۳ assertion مستقل ارائه کرده؛ ادعای ۳۷/۳۷ متعلق به S1 دقیقاً بازتولید نشده و محدودیت شواهد باقی است. |
+| SIM-01 / Revision 3 | S1 | S2 مستقل؛ S5 مشورت | **ASSIGNED** روی شاخه `sim-01-quote-contract-r3` با مبنای `4c8f77f9ade041bc3a8051758817c9a6aea79adf`. فقط B1 را با تفکیک آزمون full-pipeline از isolated pair-gate اصلاح کند؛ LIVE نباید فعال شود. پس از تحویل، S2 روی SHA جدید Review-3 انجام دهد. |
 | DEX-02-01 / Revision 1 | S1 | S2 بازبین اصلی؛ S5 بازبینی تخصصی شواهد | **ACCEPTED — DISCOVERY ONLY** در SHA `38be85dd629ca55e34dd165440e169e0c95215a7`. مقایسه با مبنای `9acb21a38c4cacbef8af061ab86a09f06913dec2` دو کامیت جلوتر و دقیقاً یک فایل پژوهشی افزوده‌شده نشان می‌دهد. S2 گزارش **APPROVED** در `07402d2f23731ff0013720bebfe7e893ac5e4cbc` و S5 گزارش **ACCEPTED** در `67d4caa64e0a2b6cc08ffd62d38d2b240dd27966` ثبت کرده‌اند. پذیرش فقط تحقیق نمونهٔ تاریخی، محاسبات و مرز Read-only را پوشش می‌دهد؛ به معنی تأیید Adapter یا آمادگی عملیاتی نیست. |
 | DEX-02-01 / Integration readiness | Agent 0 | S1، S2 و S5 | **BLOCKED / NOT READY** تا تعیین تکلیف تصمیم‌ها و آزمون‌های لازم. هنوز Adapter مجاز نیست. موارد باز شامل D-01 (بازارها، ارائه‌دهنده‌ها و روابط اولیه)، D-03 (هزینه‌ها، تبدیل، حجم، آستانه و تازگی)، رفتار BUY در تقسیم دقیق، منبع تا Bytecode equivalence و آزمون‌های lag، outage، throttling، fallback و recovery است. |
 | قرارداد تشخیص فرصت | S2 | S3؛ مشورت S1 و S5 | وابسته به پذیرش SIM-01 Revision 2 و تثبیت تصمیمات لازم D-01/D-03 است. طراحی می‌تواند با فرض‌های صریح ادامه یابد، اما قرارداد Quote پذیرفته‌نشده را نباید مبنای نهایی تلقی کند. |
@@ -33,7 +35,7 @@
 ## معیارهای پذیرش و ادامه
 
 - هر پذیرش به شناسه، Revision و SHA دقیق تعلق دارد. بازبین باید مستقل از پیاده‌ساز باشد و گزارش را روی SHA نهایی ثبت کند.
-- SIM-01 Review-2 باید هر شش محور گزارش Review-1 را با شاهد پاسخ دهد: پوشش و محاسبه هزینه؛ اعتبارسنجی و اتصال پاسخ به درخواست؛ هویت بازار و نگاشت؛ تازگی و بازیابی کش؛ خطا و هم‌بستگی؛ جداسازی حالت‌ها و مقایسه دو جهت. ادعای ۳۷/۳۷ آزمون باید از حیث روش، ورودی، خروجی و قابلیت بازتولید ارزیابی شود.
+- SIM-01 Revision 2 در S2 Review-2 به دلیل B1 پذیرفته نشد. در Revision 3، ترتیب request-before-pair و پشتیبانی SIMULATION-only باید حفظ شود. آزمون full-pipeline با request و response هر دو LIVE باید `INVALID_QUOTE` بدهد؛ mismatch فقط در response نیز `INVALID_QUOTE` است؛ mixed-mode با ورودی‌های فرضیِ ازپیش‌اعتبارسنجی‌شده فقط در آزمون isolated pair-gate می‌تواند `INCOMPARABLE_QUOTES` بدهد و باید صریحاً غیرقابل‌دسترسی از producer pipeline فعلی برچسب بخورد؛ Simulation cache برای LIVE decision باید miss/غیرواجدشرایط باشد. فعال‌سازی LIVE برای رفع مثال ممنوع است. S2 باید همین موارد را روی SHA Revision 3 بازبینی کند. ادعای ۳۷/۳۷ S1 دقیقاً بازتولید نشده است؛ ۹۳ assertion مستقل S2 در گزارش Review-2 شاهد جداگانه است.
 - DEX-02-01 فقط برای تحقیق غیرعملیاتی پذیرفته شده است. بازبینی S2 نقش بازبین اصلی طبق ماتریس را پوشش می‌دهد؛ S5 شواهد و مرز Read-only را تکمیل می‌کند.
 - قبل از Adapter، هزینه‌های pool و هزینه‌های خارج از pool باید بدون دوباره‌شماری پوشش داده شوند؛ زمان مشاهده، زمان آخرین به‌روزرسانی reserve و زمان دریافت محلی نباید یکی فرض شوند.
 - D-01 و D-03 باز می‌مانند. نام SaucerSwap، Hedera، USDC و WHBAR در این بسته انتخاب قطعی فناوری یا دارایی برای محصول نیستند.
