@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arb-multidex"
+version = "0.1.0"
+description = "Offline ARB-MultiDex simulation"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest==9.2.0", "PyYAML==6.0.3", "websockets==16.0", "ruff==0.17.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
