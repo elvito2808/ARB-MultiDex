@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from threading import Lock
 
 SCHEMA = """
--- S2 stores only an ID before handoff. Fence a lost handoff against late delivery.
+-- Only a positively identified legacy ID-only claim is eligible for a new fence.
+CREATE TABLE IF NOT EXISTS sim_admission_diagnostics (id TEXT PRIMARY KEY, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sim_lost_handoffs (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS sim_workers (
     worker TEXT PRIMARY KEY, incomplete INTEGER NOT NULL DEFAULT 0,
@@ -80,9 +81,19 @@ def balance(db, account, asset):
     return Balance(int(row["units"]), sum(int(r["units"]) for r in holds))
 
 
-def seed(db, config):
-    db.execute("INSERT OR IGNORE INTO sim_workers(worker) VALUES (?)", (config.relationship_id,))
-    for (account, asset, scale), units in zip(config.assets, config.opening):
+def seed(db, workers):
+    openings = {}
+    for worker in workers:
+        for (account, asset, scale), units in zip(worker.assets, worker.opening):
+            key = (account, asset)
+            if openings.setdefault(key, (scale, units)) != (scale, units):
+                raise ValueError("conflicting opening declarations for a shared simulated asset")
+
+    db.executemany(
+        "INSERT OR IGNORE INTO sim_workers(worker) VALUES (?)",
+        [(worker.relationship_id,) for worker in workers],
+    )
+    for (account, asset), (scale, units) in openings.items():
         db.execute(
             "INSERT OR IGNORE INTO sim_balances VALUES (?,?,?,?)",
             (account, asset, scale, str(units)),

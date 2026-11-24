@@ -1,18 +1,13 @@
 """Project an admitted S2 request into simulated, venue-local asset movements."""
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from arb_multidex.dex.saucerswap import PAIR, SOURCE, USDC, WHBAR
 from arb_multidex.opportunity import Amount, Direction, ExecutionRequest, Market
-from arb_multidex.opportunity.validation import (
-    Rejection,
-    atoms,
-    check_cost_fields,
-    message,
-    observation,
-)
+from arb_multidex.opportunity.models import SeparateCost
+from arb_multidex.opportunity.validation import atoms
 
 
 @dataclass(frozen=True)
@@ -146,57 +141,8 @@ class FailurePlan:
                 raise ValueError("invalid simulated receipt sequence")
 
 
-def _gas(request, dex, config, original_quote):
-    # S2's Leg stores final settlement, but drops includedCosts. Use the exact S1
-    # envelope retained by the caller for that S2 evaluation, never a fresh quote.
-    quote = message(original_quote)
-    expected = {
-        "status": "OK",
-        "requestId": dex.request_id,
-        "relationshipId": request.relationship_id,
-        "mappingRevision": request.mapping_revision,
-        "feePolicyId": request.fee_policy_id,
-        "mode": "SIMULATION",
-        "sourceId": dex.market.source_id,
-        "connectionEpoch": dex.epoch,
-        "side": dex.side,
-        "baseAssetId": dex.market.base_id,
-        "settlementAssetId": dex.market.settlement_id,
-        "baseUnits": str(dex.base.units),
-        "baseScale": dex.base.scale,
-        "settlementScale": dex.settlement.scale,
-        "settlementUnits": str(dex.settlement.units),
-    }
-    if (
-        any(quote.get(k) != v for k, v in expected.items())
-        or observation(quote["observedAt"]) != dex.observed_ms
-    ):
-        raise ValueError("DEX quote differs from accepted leg")
-    # The owner DEX quote contains an embedded pool fee and one separate native gas cost.
-    check_cost_fields(quote["includedCosts"])
-    fees = [fee for fee in quote["includedCosts"] if fee["treatment"] != "EMBEDDED"]
-    if len(fees) != 1:
-        raise ValueError("missing or unsupported separate DEX cost")
-    fee = fees[0]
-    if (fee["costId"], fee["treatment"], fee["assetId"], fee["scale"]) != (
-        "gas",
-        "SEPARATE",
-        config.gas_asset,
-        config.gas_scale,
-    ) or not fee["rateRef"]:
-        raise ValueError("invalid simulated gas evidence")
-    gas = atoms(fee["units"], allow_zero=True)
-    denominator = atoms(fee["rateDenominator"])
-    cost = (gas * atoms(fee["rateNumerator"]) + denominator - 1) // denominator
-    gross = atoms(quote["grossSettlementUnits"])
-    final = gross + cost if dex.side == "BUY" else gross - cost
-    if cost != atoms(fee["settlementCostUnits"], allow_zero=True) or final != dex.settlement.units:
-        raise ValueError("gas evidence disagrees with final settlement")
-    return gross, gas, fee
-
-
-def prepare(request: ExecutionRequest, config, dex_quote):
-    """Validate the accepted terms and produce signed ledger entries per adapter."""
+def prepare(request: ExecutionRequest, config):
+    """Project a guard-verified request onto this worker's simulated accounts."""
     if type(request.evaluated_ms) is not int or type(request.expires_ms) is not int:
         raise ValueError("invalid request timestamps")
     if request.status != "ACCEPTED" or request.direction not in tuple(Direction):
@@ -242,22 +188,35 @@ def prepare(request: ExecutionRequest, config, dex_quote):
         request.threshold.at(scale), config.minimum_profit.at(scale)
     ):
         raise ValueError("invalid or insufficient net profit")
-    try:
-        gross, gas, evidence = _gas(request, dex, config, dex_quote)
-    except (KeyError, TypeError, ValueError, Rejection) as exc:
-        raise ValueError("missing or invalid matching DEX gas evidence") from exc
+    # Gross already incorporates embedded costs. The only foreign fee inventory
+    # configured on this wallet is native gas; other supported fees settle locally.
+    separate = [cost for cost in dex.costs if isinstance(cost, SeparateCost)]
+    gas_costs = [cost for cost in separate if cost.cost_id == "gas"]
+    if len(gas_costs) != 1:
+        raise ValueError("one admitted native gas cost is required")
+    gas = gas_costs[0]
+    if (gas.asset_id, gas.native.scale) != (config.gas_asset, config.gas_scale) or gas.rate is None:
+        raise ValueError("admitted gas differs from configured native inventory")
+    local_fees = [cost for cost in separate if cost.cost_id != "gas"]
+    if any(cost.asset_id != dex.market.settlement_id for cost in local_fees):
+        raise ValueError("unsupported separate DEX fee asset")
+    if any(
+        isinstance(cost, SeparateCost) and cost.asset_id != spot.market.settlement_id
+        for cost in spot.costs
+    ):
+        raise ValueError("unsupported separate KuCoin fee asset")
     sign = 1 if dex.side == "BUY" else -1
     amounts = (
         sign * dex.base.units,
-        -sign * gross,
-        -gas,
+        -sign * dex.gross_settlement.units - sum(cost.native.units for cost in local_fees),
+        -gas.native.units,
         -sign * spot.base.units,
         sign * spot.settlement.units,
     )
     entries = [
         [account, asset, delta] for (account, asset, _), delta in zip(config.assets, amounts)
     ]
-    return {"DEX": entries[:3], "KUCOIN": entries[3:]}, evidence
+    return {"DEX": entries[:3], "KUCOIN": entries[3:]}, asdict(gas)
 
 
 def simulate_dex(entries, outcome):

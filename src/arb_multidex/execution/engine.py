@@ -4,7 +4,9 @@ import json
 from dataclasses import asdict, dataclass
 from time import time_ns
 
-from arb_multidex.opportunity import ExecutionRequest
+from arb_multidex.opportunity import Amount, Direction, ExecutionRequest, Leg, Market, Rate
+from arb_multidex.opportunity.guard import AdmissionEvidenceError, ExecutionGuard, LegacyAdmission
+from arb_multidex.opportunity.models import AcceptedCost, SeparateCost
 
 from . import journal
 from .simulation import FailurePlan, prepare, simulate_dex, simulate_kucoin
@@ -36,6 +38,33 @@ class WorkerState:
     consecutive_incomplete: int
 
 
+def _typed_replay(request):
+    # JSON alone erases enum/string, dataclass/dict and tuple/list distinctions.
+    if (
+        type(request.direction) is not Direction
+        or type(request.net_profit) is not Amount
+        or type(request.threshold) is not Amount
+    ):
+        return False
+    for leg in (request.buy, request.sell):
+        if type(leg) is not Leg or type(leg.market) is not Market or type(leg.costs) is not tuple:
+            return False
+        if any(
+            type(amount) is not Amount
+            for amount in (leg.base, leg.gross_settlement, leg.settlement)
+        ):
+            return False
+        for cost in leg.costs:
+            if type(cost) is SeparateCost:
+                if type(cost.native) is not Amount or (
+                    cost.rate is not None and type(cost.rate) is not Rate
+                ):
+                    return False
+            elif type(cost) is not AcceptedCost:
+                return False
+    return True
+
+
 def _run(db, execution_id):
     row = db.execute("SELECT * FROM sim_runs WHERE id=?", (execution_id,)).fetchone()
     if row is None:
@@ -56,17 +85,15 @@ def _finish(db, run, state, reason=None):
 
 
 class SimulationEngine:
-    """Pass explicit WorkerConfigs and optionally S2's ExecutionGuard.
+    """Use paired file-backed S2 and S3 journals and a shared UTC millisecond clock.
 
-    execute(request, dex_quote=...) runs to a final or unknown receipt. submit
-    and advance expose the same durable transitions to a scheduler. At startup
-    call recover() before opening admission, with the same paired S2 and S3
-    journals. Pass the original S1 simulated DEX response retained for the
-    accepted S2 leg as dex_quote. It contains the native gas cost omitted
-    from ExecutionRequest. Seeding an existing journal never refills inventory.
+    Call recover() before opening admission. submit() reserves from the verified
+    S2 record; advance() drives one durable simulation transition at a time.
     """
 
-    def __init__(self, path, workers, *, guard=None, clock=None):
+    def __init__(self, path, workers, *, guard: ExecutionGuard, clock=None):
+        if guard is None:
+            raise ValueError("a shared S2 admission guard is required")
         workers = tuple(workers)
         self.workers = {w.relationship_id: w for w in workers}
         if not 1 <= len(workers) <= 3 or len(self.workers) != len(workers):
@@ -76,8 +103,7 @@ class SimulationEngine:
         self.journal = journal.Journal(path)
         try:
             with self.journal.transaction() as db:
-                for config in workers:
-                    journal.seed(db, config)
+                journal.seed(db, workers)
         except BaseException:
             self.close()
             raise
@@ -108,68 +134,122 @@ class SimulationEngine:
             and evaluated <= now < expires
         )
 
-    def submit(self, request: ExecutionRequest, *, dex_quote=None, plan=SUCCESS_PLAN):
+    @staticmethod
+    def _journaled(db, request):
+        execution_id = request.execution_id
+        old = db.execute("SELECT request FROM sim_runs WHERE id=?", (execution_id,)).fetchone()
+        if old is not None:
+            if not _typed_replay(request) or old["request"] != json.dumps(
+                asdict(request), sort_keys=True, allow_nan=False
+            ):
+                raise ValueError("execution ID already belongs to different terms")
+            return True
+        return (
+            db.execute("SELECT 1 FROM sim_lost_handoffs WHERE id=?", (execution_id,)).fetchone()
+            is not None
+        )
+
+    def _defer(self, error):
+        reason = str(error)
+        with self.journal.transaction() as db:
+            db.execute(
+                "INSERT INTO sim_admission_diagnostics VALUES (?,?) "
+                "ON CONFLICT(id) DO UPDATE SET reason=excluded.reason",
+                (error.execution_id, reason),
+            )
+        return Result(error.execution_id, "AWAITING_RECONCILIATION", reason, ())
+
+    def submit(self, request: ExecutionRequest, *, plan=SUCCESS_PLAN):
         if (
-            not isinstance(request, ExecutionRequest)
-            or not isinstance(request.execution_id, str)
+            type(request) is not ExecutionRequest
+            or type(request.execution_id) is not str
             or not request.execution_id
         ):
             raise ValueError("expected an identified S2 ExecutionRequest")
         if not isinstance(plan, FailurePlan):
             raise TypeError("invalid simulation failure plan")
-        config = self.workers[request.relationship_id]
         execution_id = request.execution_id
-        encoded = json.dumps(asdict(request), sort_keys=True)
+        with self.journal.transaction(write=False) as db:
+            replay = self._journaled(db, request)
+        if replay:
+            return self.result(execution_id)
+
+        # S2 may use the same SQLite file. Do not acquire its Python lock while
+        # holding a writer transaction. Only S3 acknowledges journaled outcomes.
+        try:
+            accepted = self.guard.verify_pending(request)
+        except AdmissionEvidenceError as exc:
+            return self._defer(exc)
         with self.journal.transaction() as db:
-            if db.execute("SELECT 1 FROM sim_lost_handoffs WHERE id=?", (execution_id,)).fetchone():
-                return Result(execution_id, "REJECTED", "S2 handoff lost before execution", ())
-            old = db.execute("SELECT request FROM sim_runs WHERE id=?", (execution_id,)).fetchone()
-            if old is not None:
-                if old["request"] != encoded:
-                    raise ValueError("execution ID already belongs to different terms")
-            else:
-                worker = config.relationship_id
-                db.execute(
-                    "INSERT INTO sim_runs(id, worker, network, request, moves, script, state) "
-                    "VALUES (?,?,?,?,?,?, 'REJECTED')",
-                    (
-                        execution_id,
-                        worker,
-                        config.dex.network,
-                        encoded,
-                        "{}",
-                        json.dumps(asdict(plan)),
-                    ),
-                )
-                try:
-                    moves, gas_evidence = prepare(request, config, dex_quote)
-                    state = db.execute(
-                        "SELECT paused,stopped FROM sim_workers WHERE worker=?", (worker,)
-                    ).fetchone()
-                    if state["paused"] or state["stopped"]:
-                        raise ValueError("TRADING_PAUSED" if state["paused"] else "STOPPED")
-                    if not self._fresh(request.evaluated_ms, request.expires_ms):
-                        raise ValueError("quote outside its validity window")
-                    if db.execute(
-                        "SELECT 1 FROM sim_runs WHERE (network=? OR worker=?) AND state IN ('DEX','KUCOIN')",
-                        (config.dex.network, worker),
-                    ).fetchone():
-                        raise ValueError("active execution on worker or network")
-                    journal.reserve(db, execution_id, moves)
-                except ValueError as exc:
-                    db.execute("UPDATE sim_runs SET reason=? WHERE id=?", (str(exc), execution_id))
-                else:
-                    db.execute(
-                        "UPDATE sim_runs SET state='DEX', moves=?, gas_evidence=? WHERE id=?",
-                        (json.dumps(moves), json.dumps(gas_evidence), execution_id),
+            # Another driver may have reserved, finished and acknowledged while
+            # verification was in flight. This check also covers a now-spent claim.
+            if not self._journaled(db, request):
+                if accepted is None:
+                    reason = (
+                        "unknown relationship"
+                        if type(request.relationship_id) is str
+                        and request.relationship_id not in self.workers
+                        else "no matching pending S2 admission"
                     )
+                    return Result(execution_id, "REJECTED", reason, ())
+                config = self.workers.get(accepted.relationship_id)
+                if config is None:
+                    return Result(execution_id, "REJECTED", "unknown relationship", ())
+                self._reserve_accepted(db, accepted, config, plan)
         return self.result(execution_id)
+
+    def _reserve_accepted(self, db, request, config, plan):
+        execution_id = request.execution_id
+        worker = config.relationship_id
+        db.execute(
+            "INSERT INTO sim_runs(id, worker, network, request, moves, script, state) "
+            "VALUES (?,?,?,?,?,?, 'REJECTED')",
+            (
+                execution_id,
+                worker,
+                config.dex.network,
+                json.dumps(asdict(request), sort_keys=True),
+                "{}",
+                json.dumps(asdict(plan)),
+            ),
+        )
+        try:
+            moves, gas_evidence = prepare(request, config)
+            state = db.execute(
+                "SELECT paused,stopped FROM sim_workers WHERE worker=?", (worker,)
+            ).fetchone()
+            if state["paused"] or state["stopped"]:
+                raise ValueError("TRADING_PAUSED" if state["paused"] else "STOPPED")
+            if db.execute(
+                "SELECT 1 FROM sim_runs WHERE (network=? OR worker=?) AND state IN ('DEX','KUCOIN')",
+                (config.dex.network, worker),
+            ).fetchone():
+                raise ValueError("active execution on worker or network")
+            # The guard validated that expires_ms is the minimum of both quote
+            # deadlines and every trusted rate expiry. Sample after taking the write lock.
+            if not self._fresh(request.evaluated_ms, request.expires_ms):
+                raise ValueError("quote outside its validity window")
+            journal.reserve(db, execution_id, moves)
+        except ValueError as exc:
+            db.execute("UPDATE sim_runs SET reason=? WHERE id=?", (str(exc), execution_id))
+        else:
+            db.execute(
+                "UPDATE sim_runs SET state='DEX', moves=?, gas_evidence=? WHERE id=?",
+                (json.dumps(moves), json.dumps(gas_evidence), execution_id),
+            )
 
     def result(self, execution_id):
         with self.journal.transaction(write=False) as db:
             if db.execute("SELECT 1 FROM sim_lost_handoffs WHERE id=?", (execution_id,)).fetchone():
                 return Result(execution_id, "REJECTED", "S2 handoff lost before execution", ())
-            run = _run(db, execution_id)
+            run = db.execute("SELECT * FROM sim_runs WHERE id=?", (execution_id,)).fetchone()
+            if run is None:
+                error = db.execute(
+                    "SELECT reason FROM sim_admission_diagnostics WHERE id=?", (execution_id,)
+                ).fetchone()
+                if error is None:
+                    raise KeyError(execution_id)
+                return Result(execution_id, "AWAITING_RECONCILIATION", error["reason"], ())
             rows = db.execute(
                 "SELECT * FROM sim_attempts WHERE id=? ORDER BY leg,number", (execution_id,)
             )
@@ -186,7 +266,7 @@ class SimulationEngine:
             status = run["state"]
             if attempts and attempts[-1].status == "UNKNOWN":
                 status = "AWAITING_RECONCILIATION"
-        if run["state"] not in ACTIVE and self.guard is not None and not run["guard_resolved"]:
+        if run["state"] not in ACTIVE and not run["guard_resolved"]:
             # Outside the S3 transaction: S2 may use the very same SQLite file.
             # Replaying this acknowledgement after a crash is idempotent.
             self.guard.resolve(execution_id)
@@ -276,48 +356,52 @@ class SimulationEngine:
             ).rowcount
             if changed != 1:
                 raise ValueError("no matching unknown attempt")
-        return self._drain(execution_id)
+        return self._drain(self.result(execution_id))
 
-    def _drain(self, execution_id):
-        result = self.result(execution_id)
+    def _drain(self, result):
         while result.status in ACTIVE:
-            result = self.advance(execution_id)
+            result = self.advance(result.execution_id)
         return result
 
     def execute(self, request, **options):
-        self.submit(request, **options)
-        return self._drain(request.execution_id)
+        return self._drain(self.submit(request, **options))
 
     def recover(self):
-        """Recover the paired journals before admitting new S2 requests.
-
-        A crash after S2 admission but before S3 submission leaves only the
-        claim ID. Fence it in S3 before releasing the claim. The opportunity
-        stays spent, with no simulated fill or reservation to reconstruct.
-        """
-        lost = []
-        if self.guard is not None:
-            for execution_id in self.guard.pending():
-                with self.journal.transaction() as db:
-                    if db.execute("SELECT 1 FROM sim_runs WHERE id=?", (execution_id,)).fetchone():
-                        continue
-                    db.execute(
-                        "INSERT OR IGNORE INTO sim_lost_handoffs VALUES (?)", (execution_id,)
-                    )
-                self.guard.resolve(execution_id)
-                lost.append(
-                    Result(execution_id, "REJECTED", "S2 handoff lost before execution", ())
-                )
+        """Resume durable S3 outcomes first; classify unjournaled S2 claims independently."""
         with self.journal.transaction(write=False) as db:
             ids = [
                 r[0]
                 for r in db.execute(
-                    "SELECT id FROM sim_runs WHERE state IN ('DEX','KUCOIN') "
-                    "OR (? AND guard_resolved=0) ORDER BY rowid",
-                    (self.guard is not None,),
+                    "SELECT id FROM sim_runs WHERE state IN ('DEX','KUCOIN') OR guard_resolved=0 ORDER BY rowid"
                 )
             ]
-        return tuple(lost) + tuple(self._drain(i) for i in ids)
+        results = {i: self._drain(self.result(i)) for i in ids}
+        for execution_id in self.guard.pending():
+            if execution_id in results:
+                continue
+            with self.journal.transaction(write=False) as db:
+                existing = db.execute(
+                    "SELECT 1 FROM sim_runs WHERE id=?", (execution_id,)
+                ).fetchone()
+            if existing:
+                results[execution_id] = self._drain(self.result(execution_id))
+                continue
+            try:
+                admitted = self.guard.read_pending(execution_id)
+            except AdmissionEvidenceError as exc:
+                results[execution_id] = self._defer(exc)
+                continue
+            if isinstance(admitted, ExecutionRequest):
+                results[execution_id] = self.execute(admitted)
+            elif isinstance(admitted, LegacyAdmission):
+                with self.journal.transaction() as db:
+                    db.execute(
+                        "INSERT OR IGNORE INTO sim_lost_handoffs VALUES (?)", (execution_id,)
+                    )
+                self.guard.resolve(execution_id)
+                results[execution_id] = self.result(execution_id)
+            # None means another driver resolved the claim after enumeration.
+        return tuple(results.values())
 
     def stop_worker(self, worker):
         """Close admission first, then drain accepted work or leave an unknown receipt durable."""
@@ -333,7 +417,7 @@ class SimulationEngine:
                     (worker,),
                 )
             ]
-        return tuple(self._drain(i) for i in ids)
+        return tuple(self._drain(self.result(i)) for i in ids)
 
     def manual_restart(self, worker):
         """Explicit operator action after review. Unresolved trades keep admission closed."""

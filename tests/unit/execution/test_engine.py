@@ -1,5 +1,6 @@
 """Offline acceptance tests with the real S2 types and owner simulation settings."""
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
@@ -20,8 +21,6 @@ from arb_multidex.opportunity import (
     DecisionContext,
     Direction,
     ExecutionGuard,
-    ExecutionRequest,
-    Leg,
     OpportunityDetector,
     Rate,
     Relationship,
@@ -47,12 +46,23 @@ def worker():
 
 
 @pytest.fixture
-def factory(tmp_path):
+def guard(tmp_path):
+    shared = ExecutionGuard(tmp_path / "execution.sqlite")
+    yield shared
+    shared.close()
+
+
+@pytest.fixture
+def factory(tmp_path, guard):
     engines = []
 
     def build(*workers, name="execution.sqlite", **options):
         engine = SimulationEngine(
-            tmp_path / name, workers, clock=options.pop("clock", MockClock()), **options
+            tmp_path / name,
+            workers,
+            clock=options.pop("clock", MockClock()),
+            guard=options.pop("guard", guard),
+            **options,
         )
         engines.append(engine)
         return engine
@@ -62,59 +72,84 @@ def factory(tmp_path):
         engine.close()
 
 
-def handoff(worker, direction=BUY_DEX, identifier="run", profit=MIN):
-    dex_buy = direction == BUY_DEX
-    dex_final = GROSS + GAS_VALUE if dex_buy else GROSS - GAS_VALUE
-    spot_final = dex_final + profit if dex_buy else dex_final - profit
-    clock = MockClock()
-    base = Amount(VOLUME, 8)
-    dex = Leg(
-        "SIMULATION",
-        worker.dex,
-        identifier + "-dex",
-        "BUY" if dex_buy else "SELL",
-        base,
-        Amount(dex_final, 6),
-        "mock-1",
-        clock(),
-        clock() + 5000,
-    )
-    spot = Leg(
-        "SIMULATION",
-        worker.kucoin,
-        identifier + "-spot",
-        "SELL" if dex_buy else "BUY",
-        base,
-        Amount(spot_final, 6),
-        "mock-1",
-        clock(),
-        clock() + 5000,
-    )
-    request = ExecutionRequest(
-        identifier,
-        worker.relationship_id,
-        "m1",
-        "fees",
-        direction,
-        dex if dex_buy else spot,
-        spot if dex_buy else dex,
-        Amount(profit, 6),
-        worker.minimum_profit,
-        clock(),
-        clock() + 5000,
-    )
-    producer = QuoteProducer(
-        MockSaucerSwap(clock),
-        QuoteConfig(worker.relationship_id, "m1", "fees", VOLUME, 5000),
-        GasPolicy("mock/rate", mock_gas),
-    )
-    quote = producer.quote(producer.request(dex.request_id, dex.side))
-    quote.update(
-        sourceId=worker.dex.source_id,
-        settlementUnits=str(dex_final),
-        grossSettlementUnits=str(GROSS),
-    )
-    return request, quote
+@pytest.fixture
+def handoff(guard):
+    """Issue deterministic synthetic quotes through the real detector and durable guard."""
+    issued = {}
+
+    def issue(worker, direction=BUY_DEX, identifier="run", profit=MIN, *, rate_lifetime=5000):
+        key = worker, direction, identifier, profit, rate_lifetime
+        if key in issued:
+            return issued[key]
+        clock = MockClock()
+        dex_buy = direction == BUY_DEX
+        dex_final = GROSS + GAS_VALUE if dex_buy else GROSS - GAS_VALUE
+        spot_final = dex_final + profit if dex_buy else dex_final - profit
+        gas_cost = (Cost("gas", "SEPARATE", worker.gas_asset, 8, "mock/rate"),)
+        # A lower detector threshold allows the S3 owner threshold to be tested independently.
+        terms = Terms(worker.volume, Amount(min(profit, MIN), 6))
+        rel = Relationship(
+            worker.relationship_id,
+            "m1",
+            "fees",
+            Binding(worker.dex, 5000, gas_cost, gas_cost),
+            Binding(worker.kucoin, 5000, (), ()),
+            (worker.dex.base_id, worker.kucoin.base_id),
+            (worker.dex.settlement_id, worker.kucoin.settlement_id),
+            terms,
+            terms,
+            100,
+        )
+        epoch = "mock-" + identifier
+        gas = {
+            "costId": "gas",
+            "treatment": "SEPARATE",
+            "assetId": worker.gas_asset,
+            "units": str(GAS),
+            "scale": 8,
+            "rateNumerator": "1",
+            "rateDenominator": "2",
+            "settlementCostUnits": str(GAS_VALUE),
+            "rateRef": "fixture/rate",
+        }
+        calls = {}
+        for dex, final in ((True, dex_final), (False, spot_final)):
+            side = "BUY" if dex == dex_buy else "SELL"
+            original = rel.request(direction, side)
+            response = dict(
+                original,
+                status="OK",
+                connectionEpoch=epoch,
+                observedAt="2026-11-23T22:49:17.000Z",
+                grossSettlementUnits=str(GROSS if dex else final),
+                settlementUnits=str(final),
+                includedCosts=[gas] if dex else [],
+            )
+            calls[direction, side] = Call(original, response)
+        rate = Rate(
+            "mock/rate",
+            worker.gas_asset,
+            8,
+            worker.dex.settlement_id,
+            6,
+            1,
+            2,
+            clock(),
+            clock() + rate_lifetime,
+        )
+        ctx = DecisionContext(
+            clock(),
+            {m.source_id: SourceState(epoch, True, clock()) for m in (worker.dex, worker.kucoin)},
+            {"fixture/rate": rate},
+        )
+        detector = OpportunityDetector(guard, lambda _: nullcontext(ctx))
+        detector.register(rel)
+        req = detector.evaluate(worker.relationship_id, calls).execution_request
+        if req is not None:
+            issued[key] = req
+        return req
+
+    return issue
 
 
 def balances(engine, worker):
@@ -122,22 +157,16 @@ def balances(engine, worker):
 
 
 @pytest.mark.parametrize("direction", [BUY_DEX, SELL_DEX])
-def test_owner_balance_changes_exact_profit_boundary(worker, factory, direction):
+def test_owner_balance_changes_exact_profit_boundary(worker, factory, handoff, direction):
     e = factory(worker)
     initial = (1000 * 10**8, 500 * 10**6, 10 * 10**8, 1000 * 10**8, 500 * 10**6)
     assert balances(e, worker) == tuple(Balance(n, 0) for n in initial)
-    req, quote = handoff(worker, direction)
-    side = "buy" if direction == BUY_DEX else "sell"
-    dex_leg = getattr(req, side)
-    checksum_pool = "0xdB34c1Ef944883f0e5A2fC18B6C1978B088bD31d"
-    req = replace(
-        req, **{side: replace(dex_leg, market=replace(dex_leg.market, pool=checksum_pool))}
-    )
+    req = handoff(worker, direction)
     with (
         patch("socket.socket", side_effect=AssertionError("network access")),
         patch("subprocess.Popen", side_effect=AssertionError("external process")),
     ):
-        result = e.execute(req, dex_quote=quote)
+        result = e.execute(req)
     assert result.status == "COMPLETED"
     assert [(a.leg, a.status) for a in result.attempts] == [
         ("DEX", "SUCCESS"),
@@ -161,13 +190,15 @@ def test_owner_balance_changes_exact_profit_boundary(worker, factory, direction)
         (SELL_DEX, 4, GROSS - GAS_VALUE - MIN),
     ],
 )
-def test_one_atom_short_rejects_entire_reservation(worker, factory, direction, index, required):
+def test_one_atom_short_rejects_entire_reservation(
+    worker, factory, handoff, direction, index, required
+):
     opening = list(worker.opening)
     opening[index] = required - 1
     worker = replace(worker, opening=tuple(opening))
     e = factory(worker)
-    req, quote = handoff(worker, direction)
-    result = e.execute(req, dex_quote=quote)
+    req = handoff(worker, direction)
+    result = e.execute(req)
     assert result.status == "REJECTED" and "insufficient" in result.reason
     assert result.attempts == ()
     assert balances(e, worker) == tuple(Balance(n, 0) for n in opening)
@@ -193,9 +224,9 @@ def test_one_atom_short_rejects_entire_reservation(worker, factory, direction, i
         "missing_cost",
     ],
 )
-def test_invalid_handoffs_fail_before_reservation(worker, factory, case):
+def test_invalid_handoffs_fail_before_reservation(worker, factory, handoff, case):
     e = factory(worker)
-    req, quote = handoff(worker, profit=MIN - 1 if case == "profit" else MIN)
+    req = handoff(worker, profit=MIN - 1 if case == "profit" else MIN)
     if case == "forged_profit":
         req = replace(req, net_profit=Amount(MIN + 1, 6))
     elif case == "volume":
@@ -217,14 +248,14 @@ def test_invalid_handoffs_fail_before_reservation(worker, factory, case):
     elif case == "direction":
         req = replace(req, direction="unknown")
     elif case == "missing_gas":
-        quote = None
+        req = replace(req, buy=replace(req.buy, costs=()))
     elif case == "wrong_quote":
-        quote["requestId"] = "different"
+        req = replace(req, buy=replace(req.buy, request_id="different"))
     elif case == "wrong_rate":
-        quote["includedCosts"][1]["rateDenominator"] = "1"
+        req = replace(req, buy=replace(req.buy, costs=(replace(req.buy.costs[0], denominator=1),)))
     elif case == "missing_cost":
-        quote["includedCosts"] = []
-    result = e.execute(req, dex_quote=quote)
+        req = replace(req, buy=replace(req.buy, gross_settlement=req.buy.settlement))
+    result = e.execute(req)
     assert result.status == "REJECTED" and result.attempts == ()
     assert balances(e, worker) == tuple(Balance(n, 0) for n in worker.opening)
 
@@ -237,10 +268,12 @@ def test_invalid_handoffs_fail_before_reservation(worker, factory, case):
         ((), FAIL, "INCOMPLETE_ARBITRAGE", ["DEX"] + ["KUCOIN"] * 3),
     ],
 )
-def test_retry_limits_and_confirmed_inventory(worker, factory, dex, spot, terminal, history):
+def test_retry_limits_and_confirmed_inventory(
+    worker, factory, handoff, dex, spot, terminal, history
+):
     e = factory(worker)
-    req, quote = handoff(worker)
-    result = e.execute(req, dex_quote=quote, plan=FailurePlan(dex, spot))
+    req = handoff(worker)
+    result = e.execute(req, plan=FailurePlan(dex, spot))
     assert result.status == terminal and [a.leg for a in result.attempts] == history
     assert all(a.number == history[: i + 1].count(a.leg) for i, a in enumerate(result.attempts))
     expect = list(worker.opening)
@@ -253,10 +286,10 @@ def test_retry_limits_and_confirmed_inventory(worker, factory, dex, spot, termin
 
 
 @pytest.mark.parametrize("cut", range(9))
-def test_reopen_at_each_durable_boundary(worker, factory, cut):
-    req, quote = handoff(worker)
+def test_reopen_at_each_durable_boundary(worker, factory, handoff, cut):
+    req = handoff(worker)
     e = factory(worker)
-    e.submit(req, dex_quote=quote, plan=FailurePlan(("FAILED",), ("FAILED",)))
+    e.submit(req, plan=FailurePlan(("FAILED",), ("FAILED",)))
     for _ in range(cut):
         e.advance(req.execution_id)
     e.close()
@@ -276,11 +309,11 @@ def test_reopen_at_each_durable_boundary(worker, factory, cut):
 
 
 @pytest.mark.parametrize("venue", ["DEX", "KUCOIN"])
-def test_unknown_holds_resources_until_exact_receipt(worker, factory, venue):
-    req, quote = handoff(worker)
+def test_unknown_holds_resources_until_exact_receipt(worker, factory, handoff, venue):
+    req = handoff(worker)
     e = factory(worker)
     plan = FailurePlan(dex=("UNKNOWN",)) if venue == "DEX" else FailurePlan(kucoin=("UNKNOWN",))
-    result = e.execute(req, dex_quote=quote, plan=plan)
+    result = e.execute(req, plan=plan)
     assert result.status == "AWAITING_RECONCILIATION" and result.attempts[-1].leg == venue
     assert e.stop_worker(worker.relationship_id) == (result,)
     e.close()
@@ -300,10 +333,10 @@ def test_unknown_holds_resources_until_exact_receipt(worker, factory, venue):
 
 
 @pytest.mark.parametrize("last", ["SUCCESS", "FAILED"])
-def test_partial_fill_retries_only_remaining_inventory(worker, factory, last):
+def test_partial_fill_retries_only_remaining_inventory(worker, factory, handoff, last):
     e = factory(worker)
-    req, quote = handoff(worker, profit=MIN + 2)
-    result = e.execute(req, dex_quote=quote, plan=FailurePlan(kucoin=("PARTIAL", "FAILED", last)))
+    req = handoff(worker, profit=MIN + 2)
+    result = e.execute(req, plan=FailurePlan(kucoin=("PARTIAL", "FAILED", last)))
     assert result.status == ("COMPLETED" if last == "SUCCESS" else "INCOMPLETE_ARBITRAGE")
     filled = VOLUME if last == "SUCCESS" else VOLUME // 2
     credit = req.sell.settlement.units * filled // VOLUME
@@ -321,13 +354,13 @@ def independent(worker, number):
     )
 
 
-def test_three_workers_pause_isolation_and_manual_restart(worker, factory):
+def test_three_workers_pause_isolation_and_manual_restart(worker, factory, handoff):
     workers = (worker, independent(worker, 2), independent(worker, 3))
     e = factory(*workers)
 
     def trade(w, n, incomplete=True):
-        req, quote = handoff(w, identifier=f"{w.relationship_id}-{n}")
-        return e.execute(req, dex_quote=quote, plan=FailurePlan(kucoin=FAIL if incomplete else ()))
+        req = handoff(w, identifier=f"{w.relationship_id}-{n}")
+        return e.execute(req, plan=FailurePlan(kucoin=FAIL if incomplete else ()))
 
     for i in range(4):
         assert trade(worker, i).status == "INCOMPLETE_ARBITRAGE"
@@ -349,18 +382,18 @@ def test_three_workers_pause_isolation_and_manual_restart(worker, factory):
     assert trade(worker, 6, False).status == "COMPLETED"
 
 
-def test_graceful_stop_drains_recorded_execution(worker, factory):
+def test_graceful_stop_drains_recorded_execution(worker, factory, handoff):
     e = factory(worker)
-    req, quote = handoff(worker)
-    e.submit(req, dex_quote=quote)
+    req = handoff(worker)
+    e.submit(req)
     assert e.advance(req.execution_id).attempts[-1].status == "SUBMITTED"
     assert e.stop_worker(worker.relationship_id)[0].status == "COMPLETED"
-    req, quote = handoff(worker, identifier="later")
-    assert e.execute(req, dex_quote=quote).reason == "STOPPED"
+    req = handoff(worker, identifier="later")
+    assert e.execute(req).reason == "STOPPED"
     assert all(b.reserved == 0 for b in balances(e, worker))
 
 
-def test_concurrent_reservations_and_duplicate_drivers(worker, factory):
+def test_concurrent_reservations_and_duplicate_drivers(worker, factory, handoff):
     # Two independent engines and connections compete for one shared spot balance.
     worker = replace(worker, opening=(*worker.opening[:3], VOLUME, worker.opening[4]))
     workers = (worker, independent(worker, 2))
@@ -369,9 +402,9 @@ def test_concurrent_reservations_and_duplicate_drivers(worker, factory):
     start = Barrier(2)
 
     def submit(i):
-        req, quote = calls[i]
+        req = calls[i]
         start.wait()
-        return engines[i].submit(req, dex_quote=quote)
+        return engines[i].submit(req)
 
     with ThreadPoolExecutor(2) as pool:
         results = list(pool.map(submit, range(2)))
@@ -379,13 +412,13 @@ def test_concurrent_reservations_and_duplicate_drivers(worker, factory):
         winner = next(i for i, r in enumerate(results) if r.status == "DEX")
         assert balances(engines[0], workers[winner])[3] == Balance(VOLUME, VOLUME)
         assert all(b.reserved == 0 for b in balances(engines[1], workers[1 - winner])[:3])
-        req, quote = calls[winner]
-        finals = list(pool.map(lambda e: e.execute(req, dex_quote=quote), engines))
+        req = calls[winner]
+        finals = list(pool.map(lambda e: e.execute(req), engines))
     assert finals[0] == finals[1] and len(finals[0].attempts) == 2
     assert balances(engines[0], workers[winner])[3] == Balance(0, 0)
 
 
-def test_unresolved_worker_allows_independent_but_blocks_same_network(worker, factory):
+def test_unresolved_worker_allows_independent_but_blocks_same_network(worker, factory, handoff):
     same = replace(worker, relationship_id="same")
     other = independent(worker, 2)
     e = factory(worker, same, other)
@@ -394,17 +427,19 @@ def test_unresolved_worker_allows_independent_but_blocks_same_network(worker, fa
         (same, "REJECTED"),
         (other, "COMPLETED"),
     ]:
-        req, quote = handoff(w, identifier=w.relationship_id)
+        req = handoff(w, identifier=w.relationship_id)
+        if w == same:
+            assert req is None  # S2 holds this network while the DEX is unresolved.
+            continue
         result = e.execute(
             req,
-            dex_quote=quote,
             plan=FailurePlan(dex=("UNKNOWN",)) if w == worker else FailurePlan(),
         )
         assert result.status == expected
 
 
 @pytest.mark.parametrize("direction", [BUY_DEX, SELL_DEX])
-def test_real_s1_s2_s3_handoff(worker, factory, tmp_path, direction):
+def test_real_s1_s2_s3_handoff(worker, factory, guard, direction):
     clock = MockClock()
     cfg = QuoteConfig(worker.relationship_id, "m1", "fees", VOLUME, 5000)
     dex = QuoteProducer(MockSaucerSwap(clock), cfg, GasPolicy("mock/rate", mock_gas))
@@ -448,56 +483,45 @@ def test_real_s1_s2_s3_handoff(worker, factory, tmp_path, direction):
         {p.feed.source_id: SourceState(p.feed.epoch, True, clock()) for p in (dex, spot)},
         {gas.rate_ref: rate},
     )
-    guard = ExecutionGuard(tmp_path / "execution.sqlite")
-    try:
-        detector = OpportunityDetector(guard, lambda _: nullcontext(ctx))
-        detector.register(rel)
-        req = detector.evaluate(worker.relationship_id, calls).execution_request
-        assert req is not None and guard.pending() == (req.execution_id,)
-        e = factory(worker, guard=guard, clock=clock)
-        dex_quote = calls[direction, "BUY" if direction == BUY_DEX else "SELL"].response
-        assert e.execute(req, dex_quote=dex_quote).status == "COMPLETED"
-        assert guard.pending() == ()
-        assert detector.evaluate(worker.relationship_id, calls).execution_request is None
-    finally:
-        guard.close()
+    detector = OpportunityDetector(guard, lambda _: nullcontext(ctx))
+    detector.register(rel)
+    req = detector.evaluate(worker.relationship_id, calls).execution_request
+    assert req is not None and guard.pending() == (req.execution_id,)
+    e = factory(worker, guard=guard, clock=clock)
+    assert e.execute(req).status == "COMPLETED"
+    assert guard.pending() == ()
+    assert detector.evaluate(worker.relationship_id, calls).execution_request is None
 
 
-def test_recover_guard_claim_before_and_after_execution(worker, factory, tmp_path):
-    guard = ExecutionGuard(tmp_path / "execution.sqlite")
-    try:
-        req, quote = handoff(worker)
-        assert guard.admit(req, worker.dex.network)
-        e = factory(worker, guard=guard)
-        # Crash between S2 admission and S3 receipt of the request.
-        (lost,) = e.recover()
-        assert lost.execution_id == req.execution_id and lost.status == "REJECTED"
-        assert guard.pending() == ()
-        assert e.result(req.execution_id) == e.execute(req, dex_quote=quote) == lost
-        assert e.recover() == ()
-        req, quote = handoff(worker, identifier="after")
-        assert guard.admit(req, worker.dex.network)
-        with (
-            patch.object(guard, "resolve", side_effect=OSError("simulated crash")),
-            pytest.raises(OSError, match="simulated crash"),
-        ):
-            e.execute(req, dex_quote=quote)
-        e.close()
-        assert guard.pending() == (req.execution_id,)
-        restarted = factory(worker, guard=guard)
-        (result,) = restarted.recover()
-        assert result.status == "COMPLETED" and len(result.attempts) == 2
-        assert balances(restarted, worker)[2] == Balance(worker.opening[2] - GAS, 0)
-        assert guard.pending() == ()
-    finally:
-        guard.close()
+def test_recover_guard_claim_before_and_after_execution(worker, factory, handoff, guard):
+    req = handoff(worker)
+    e = factory(worker)
+    e.close()
+    restarted = factory(worker)
+    (recovered,) = restarted.recover()
+    assert recovered.status == "COMPLETED" and recovered.execution_id == req.execution_id
+    assert guard.pending() == ()
+    assert restarted.execute(req) == recovered
+    req = handoff(worker, identifier="after")
+    with (
+        patch.object(guard, "resolve", side_effect=OSError("simulated crash")),
+        pytest.raises(OSError, match="simulated crash"),
+    ):
+        restarted.execute(req)
+    restarted.close()
+    assert guard.pending() == (req.execution_id,)
+    e = factory(worker)
+    (result,) = e.recover()
+    assert result.status == "COMPLETED" and len(result.attempts) == 2
+    assert balances(e, worker)[2] == Balance(worker.opening[2] - 2 * GAS, 0)
+    assert guard.pending() == ()
 
 
-def test_expiry_after_submission_verifies_dex_without_stale_kucoin_order(worker, factory):
+def test_expiry_after_submission_verifies_dex_without_stale_kucoin_order(worker, factory, handoff):
     clock = MockClock()
     e = factory(worker, clock=clock)
-    req, quote = handoff(worker)
-    e.submit(req, dex_quote=quote)
+    req = handoff(worker)
+    e.submit(req)
     assert e.advance(req.execution_id).attempts[-1].status == "SUBMITTED"
     clock.now_ms = req.expires_ms
     result = e.recover()[0]
@@ -507,10 +531,10 @@ def test_expiry_after_submission_verifies_dex_without_stale_kucoin_order(worker,
     assert all(b.reserved == 0 for b in balances(e, worker))
 
 
-def test_settlement_error_rolls_back_attempt_balances_and_reservations(worker, factory):
+def test_settlement_error_rolls_back_attempt_balances_and_reservations(worker, factory, handoff):
     e = factory(worker)
-    req, quote = handoff(worker)
-    e.submit(req, dex_quote=quote)
+    req = handoff(worker)
+    e.submit(req)
     pending = e.advance(req.execution_id)
     before = balances(e, worker)
     from arb_multidex.execution import journal
@@ -531,7 +555,7 @@ def test_settlement_error_rolls_back_attempt_balances_and_reservations(worker, f
     assert balances(restarted, worker)[2] == Balance(worker.opening[2] - GAS, 0)
 
 
-def test_three_simultaneous_relationships_with_exact_large_inventory(worker, factory):
+def test_three_simultaneous_relationships_with_exact_large_inventory(worker, factory, handoff):
     n = 10**70 + 7
     worker = replace(worker, opening=(n,) * 5)
     workers = [worker, independent(worker, 2), independent(worker, 3)]
@@ -541,12 +565,250 @@ def test_three_simultaneous_relationships_with_exact_large_inventory(worker, fac
 
     def submit(i):
         start.wait()
-        req, quote = calls[i]
-        return engines[i].submit(req, dex_quote=quote)
+        req = calls[i]
+        return engines[i].submit(req)
 
     with ThreadPoolExecutor(3) as pool:
         assert [r.status for r in pool.map(submit, range(3))] == ["DEX"] * 3
         assert balances(engines[0], worker)[3] == Balance(n, 3 * VOLUME)
-        finals = list(pool.map(lambda i: engines[i].execute(calls[i][0]), range(3)))
+        finals = list(pool.map(lambda i: engines[i].execute(calls[i]), range(3)))
     assert [r.status for r in finals] == ["COMPLETED"] * 3
     assert balances(engines[0], worker)[3] == Balance(n - 3 * VOLUME, 0)
+
+
+def assert_unjournaled(engine, execution_id):
+    with engine.journal.transaction(write=False) as db:
+        for table in ("sim_runs", "sim_holds", "sim_attempts", "sim_lost_handoffs"):
+            assert not db.execute(f"SELECT 1 FROM {table} WHERE id=?", (execution_id,)).fetchone()
+
+
+@pytest.mark.parametrize("direction", [BUY_DEX, SELL_DEX])
+@pytest.mark.parametrize(
+    "change", ["gross_and_gas", "rate_observation", "epoch", "market", "mapping", "fee_policy"]
+)
+def test_modified_evidence_preserves_genuine_admission(
+    worker, factory, handoff, guard, direction, change
+):
+    e = factory(worker)
+    req = handoff(worker, direction)
+    side = "buy" if direction == BUY_DEX else "sell"
+    leg = getattr(req, side)
+    gas = leg.costs[0]
+    if change == "gross_and_gas":
+        gas = replace(gas, native=Amount(7, 8), settlement_units=4)
+        gross = leg.gross_settlement.units + (-1 if direction == BUY_DEX else 1)
+        leg = replace(leg, gross_settlement=Amount(gross, 6), costs=(gas,))
+    elif change == "rate_observation":
+        leg = replace(
+            leg, costs=(replace(gas, rate=replace(gas.rate, observed_ms=gas.rate.observed_ms - 1)),)
+        )
+    elif change == "epoch":
+        leg = replace(leg, epoch="unadmitted")
+    elif change == "market":
+        leg = replace(leg, market=replace(leg.market, pool="unadmitted"))
+    changed = replace(req, **{side: leg})
+    if change == "mapping":
+        changed = replace(req, mapping_revision="other")
+    if change == "fee_policy":
+        changed = replace(req, fee_policy_id="other")
+    assert changed.execution_id == req.execution_id and changed.net_profit == req.net_profit
+    with patch.object(guard, "verify_pending", wraps=guard.verify_pending) as verified:
+        assert e.execute(changed).status == "REJECTED"
+        verified.assert_called_once_with(changed)
+    assert_unjournaled(e, req.execution_id)
+    assert guard.pending() == (req.execution_id,)
+    assert e.execute(req).status == "COMPLETED"
+    with pytest.raises(ValueError, match="different terms"):
+        e.execute(changed)
+
+
+def test_books_only_the_verified_object_and_replays_without_reverification(
+    worker, factory, handoff, guard
+):
+    from arb_multidex.execution import engine as module
+
+    e = factory(worker)
+    request = handoff(worker)
+    reads = []
+    verify = guard.verify_pending
+
+    def read(candidate):
+        assert_unjournaled(e, candidate.execution_id)
+        reads.append(verify(candidate))
+        return reads[-1]
+
+    with (
+        patch.object(guard, "verify_pending", read),
+        patch.object(module, "prepare", wraps=module.prepare) as prepare,
+    ):
+        completed = e.execute(request)
+    assert completed.status == "COMPLETED"
+    assert len(reads) == 1 and reads[0] is not request
+    assert prepare.call_args.args[0] is reads[0]
+    assert guard.pending() == ()
+    with patch.object(
+        guard, "verify_pending", side_effect=AssertionError("spent admission lookup")
+    ):
+        assert e.execute(request) == completed
+
+
+@pytest.mark.parametrize("damage", ["missing", "malformed"])
+def test_evidence_error_defers_and_keeps_claim_on_restart(
+    worker, factory, handoff, guard, tmp_path, damage
+):
+    req = handoff(worker)
+    other_worker = independent(worker, 3)
+    other = handoff(other_worker)
+    e = factory(worker, other_worker)
+    with sqlite3.connect(tmp_path / "execution.sqlite") as db:
+        if damage == "missing":
+            db.execute(
+                "DELETE FROM opportunity_admissions WHERE execution_id=?", (req.execution_id,)
+            )
+        else:
+            db.execute(
+                "UPDATE opportunity_admissions SET payload='{' WHERE execution_id=?",
+                (req.execution_id,),
+            )
+    deferred = e.execute(req)
+    assert deferred.status == "AWAITING_RECONCILIATION"
+    assert_unjournaled(e, req.execution_id)
+    e.close()
+    restarted = factory(worker, other_worker)
+    assert restarted.result(req.execution_id) == deferred
+    outcomes = {r.execution_id: r for r in restarted.recover()}
+    assert (
+        outcomes[req.execution_id] == deferred
+        and outcomes[other.execution_id].status == "COMPLETED"
+    )
+    assert guard.pending() == (req.execution_id,)
+    assert_unjournaled(restarted, req.execution_id)
+
+
+def test_only_migrated_legacy_claim_can_be_fenced(worker, factory, tmp_path):
+    from arb_multidex.opportunity.guard import LegacyAdmission
+
+    path = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(path) as db:
+        db.execute("""CREATE TABLE opportunity_requests (
+            execution_id TEXT PRIMARY KEY, relationship_id TEXT NOT NULL, network TEXT NOT NULL,
+            pending INTEGER NOT NULL, buy_request_id TEXT NOT NULL, sell_request_id TEXT NOT NULL,
+            UNIQUE(relationship_id, buy_request_id, sell_request_id))""")
+        db.execute(
+            "INSERT INTO opportunity_requests VALUES (?,?,?,1,'b','s')",
+            ("legacy-run", worker.relationship_id, worker.dex.network),
+        )
+    guard = ExecutionGuard(path)
+    try:
+        assert isinstance(guard.read_pending("legacy-run"), LegacyAdmission)
+        e = factory(worker, name=path.name, guard=guard)
+        (result,) = e.recover()
+        assert result.status == "REJECTED" and result.attempts == ()
+        assert guard.pending() == () and guard.read_pending("legacy-run") is None
+        e.close()
+        assert factory(worker, name=path.name, guard=guard).result("legacy-run") == result
+    finally:
+        guard.close()
+
+
+def test_resolved_between_enumeration_and_read_is_skipped(worker, factory, handoff, guard):
+    req = handoff(worker)
+    assert guard.resolve(req.execution_id)
+    e = factory(worker)
+    with (
+        patch.object(guard, "pending", return_value=(req.execution_id,)),
+        patch.object(guard, "resolve") as resolve,
+    ):
+        assert e.recover() == ()
+        resolve.assert_not_called()
+    assert_unjournaled(e, req.execution_id)
+    assert e.submit(req).status == "REJECTED"
+    assert_unjournaled(e, req.execution_id)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("conflict", ["units", "scale"])
+def test_conflicting_shared_inventory_rolls_back(worker, factory, tmp_path, reverse, conflict):
+    other = independent(worker, 2)
+    if conflict == "units":
+        other = replace(other, opening=(*other.opening[:4], other.opening[4] + 1))
+    else:
+        other = replace(other, kucoin=replace(other.kucoin, settlement_scale=5))
+    ordered = (other, worker) if reverse else (worker, other)
+    with pytest.raises(ValueError, match="conflicting opening"):
+        factory(*ordered)
+    with sqlite3.connect(tmp_path / "execution.sqlite") as db:
+        assert db.execute("SELECT count(*) FROM sim_balances").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_shared_inventory_seeded_once_and_reopened_in_either_order(
+    worker, factory, handoff, reverse
+):
+    other = independent(worker, 2)
+    ordered = (other, worker) if reverse else (worker, other)
+    e = factory(*ordered)
+    assert balances(e, worker)[3:] == tuple(Balance(n, 0) for n in worker.opening[3:])
+    req = handoff(worker)
+    completed = e.execute(req)
+    filled = balances(e, worker)
+    assert filled[3].recorded == worker.opening[3] - VOLUME
+    e.close()
+    restarted = factory(*reversed(ordered))
+    assert balances(restarted, worker) == filled
+    assert balances(restarted, other)[3:] == filled[3:]
+    assert restarted.execute(req) == completed
+
+
+def test_unknown_relationship_preserves_claim_and_isolates_workers(worker, factory, handoff, guard):
+    req = handoff(independent(worker, 9))
+    e = factory(worker)
+    result = e.execute(req)
+    assert (result.status, result.reason, result.attempts) == (
+        "REJECTED",
+        "unknown relationship",
+        (),
+    )
+    assert_unjournaled(e, req.execution_id)
+    assert e.execute(handoff(worker)).status == "COMPLETED"
+    assert guard.pending() == (req.execution_id,)
+
+
+@pytest.mark.parametrize("rate_lifetime", [100, 6000])
+def test_recovered_admission_rechecks_current_quote_and_rate_deadlines(
+    worker, factory, handoff, guard, rate_lifetime
+):
+    req = handoff(worker, rate_lifetime=rate_lifetime)
+    assert req.expires_ms == SAMPLE_MS + min(rate_lifetime, 5000)
+    clock = MockClock(req.expires_ms)
+    e = factory(worker, clock=clock)
+    (result,) = e.recover()
+    assert result.status == "REJECTED" and "validity window" in result.reason
+    assert result.attempts == () and guard.pending() == ()
+    assert balances(e, worker) == tuple(Balance(n, 0) for n in worker.opening)
+
+
+def test_recovered_admission_rechecks_available_balance(worker, factory, handoff, guard):
+    req = handoff(worker)
+    e = factory(replace(worker, opening=(*worker.opening[:2], GAS - 1, *worker.opening[3:])))
+    (result,) = e.recover()
+    assert result.execution_id == req.execution_id and result.status == "REJECTED"
+    assert "insufficient" in result.reason and result.attempts == () and guard.pending() == ()
+
+
+def test_replay_preserves_runtime_types_after_resolution(worker, factory, handoff):
+    e = factory(worker)
+    req = handoff(worker)
+    assert e.execute(req).status == "COMPLETED"
+    for changed in (
+        replace(req, direction=req.direction.value),
+        replace(req, buy=replace(req.buy, costs=list(req.buy.costs))),
+    ):
+        with pytest.raises(ValueError, match="different terms"):
+            e.execute(changed)
+    assert len(e.result(req.execution_id).attempts) == 2
+
+
+def test_first_submission_requires_shared_guard(worker, tmp_path):
+    with pytest.raises(ValueError, match="shared S2 admission guard"):
+        SimulationEngine(tmp_path / "s3.db", [worker], guard=None)
