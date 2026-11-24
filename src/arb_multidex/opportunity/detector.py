@@ -144,6 +144,6 @@ class OpportunityDetector:
                     context.now_ms,
                     min(buy.expires_ms, sell.expires_ms),
                 )
-                if self._guard.admit(candidate, relationship.dex.market.network):
+                if self._guard._admit(candidate, relationship.dex.market.network):
                     request = candidate
             return Evaluation(decisions, request)

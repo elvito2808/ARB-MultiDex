@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from .models import Amount, Leg, Rate, SourceState, token, valid_scale
+from .models import AcceptedCost, Amount, Leg, Rate, SeparateCost, SourceState, token, valid_scale
 
 ERROR_ORDER = ("INVALID_QUOTE", "SOURCE_UNAVAILABLE", "STALE_QUOTE", "FEE_UNAVAILABLE")
 IDS = (
@@ -123,7 +123,7 @@ def separate_cost(record, rule, market, context):
         raise ValueError("wrong cost asset or fields")
     units = atoms(record["units"], allow_zero=True)
     num, den = atoms(record["rateNumerator"]), atoms(record["rateDenominator"])
-    expires = None
+    ref = rate = None
     if foreign:
         ref = record["rateRef"]
         rate = context.rates.get(ref) if token(ref) else None
@@ -149,10 +149,15 @@ def separate_cost(record, rule, market, context):
             or not rate.observed_ms <= context.now_ms < rate.expires_ms
         ):
             raise ValueError("unverified conversion")
-        expires = rate.expires_ms
     elif num != den:
         raise ValueError("non-unit settlement rate")
-    return (units * num + den - 1) // den, expires
+    converted = (units * num + den - 1) // den
+    if converted != atoms(record["settlementCostUnits"], allow_zero=True):
+        raise ValueError("conversion does not reconcile")
+    return SeparateCost(
+        rule.cost_id, rule.treatment, converted, rule.asset_id, Amount(units, rule.scale),
+        num, den, ref, rate,
+    )
 
 
 def costs(records, required, market, context):
@@ -160,20 +165,19 @@ def costs(records, required, market, context):
         raise ValueError("incomplete cost coverage")
     remaining = {rule.cost_id: rule for rule in required}
     separate = 0
-    expiries = []
+    accepted = []
     for record in records:
         rule = remaining.pop(record["costId"])
-        amount = atoms(record["settlementCostUnits"], allow_zero=True)
         if record["treatment"] != rule.treatment:
             raise ValueError("wrong treatment")
         if rule.treatment == "SEPARATE":
-            converted, expiry = separate_cost(record, rule, market, context)
-            if converted != amount:
-                raise ValueError("conversion does not reconcile")
-            separate += amount
-            if expiry is not None:
-                expiries.append(expiry)
-    return separate, expiries
+            cost = separate_cost(record, rule, market, context)
+            separate += cost.settlement_units
+        else:
+            amount = atoms(record["settlementCostUnits"], allow_zero=True)
+            cost = AcceptedCost(rule.cost_id, rule.treatment, amount)
+        accepted.append(cost)
+    return separate, tuple(accepted)
 
 
 @dataclass(frozen=True)
@@ -255,17 +259,17 @@ def validate(call, relationship, context):
             relationship.fee_policy_id,
         )
         fee_ok = True
-        expiries = [observed + binding.max_age_ms]
+        quote_expiry = observed + binding.max_age_ms
+        accepted_costs = ()
         if bound:
             required = binding.buy_costs if req["side"] == "BUY" else binding.sell_costs
             try:
-                charge, rates_expire = costs(reply["includedCosts"], required, market, context)
+                charge, accepted_costs = costs(reply["includedCosts"], required, market, context)
             except (ValueError, KeyError, TypeError):
                 fee_ok = False
             else:
                 if final != (gross + charge if req["side"] == "BUY" else gross - charge):
                     raise Rejection()
-                expiries.extend(rates_expire)
         if (
             type(now) is not int
             or not isinstance(state, SourceState)
@@ -274,10 +278,16 @@ def validate(call, relationship, context):
             or type(state.earliest_ms) is not int
         ):
             raise Rejection("SOURCE_UNAVAILABLE")
-        if now >= expiries[0]:
+        if now >= quote_expiry:
             raise Rejection("STALE_QUOTE")
         if not fee_ok:
             raise Rejection("FEE_UNAVAILABLE")
+        if not bound:
+            return Checked(rid, None)
+        rate_expiries = (
+            cost.rate.expires_ms for cost in accepted_costs
+            if isinstance(cost, SeparateCost) and cost.rate is not None
+        )
         leg = Leg(
             req["mode"],
             market,
@@ -287,9 +297,12 @@ def validate(call, relationship, context):
             Amount(final, market.settlement_scale),
             state.epoch,
             observed,
-            min(expiries),
+            min((quote_expiry, *rate_expiries)),
+            quote_expiry,
+            Amount(gross, market.settlement_scale),
+            accepted_costs,
         )
-        return Checked(rid, None, leg, bound)
+        return Checked(rid, None, leg, bound=True)
     except Rejection as exc:
         return Checked(rid, exc.code)
     except (AttributeError, ValueError, TypeError, RecursionError, OverflowError):

@@ -2,14 +2,17 @@
 
 import json
 import re
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from threading import Event
+
+import pytest
 
 from arb_multidex.opportunity import (
     Amount,
@@ -528,3 +531,238 @@ class DetectorTest(unittest.TestCase):
             self.calls[FORWARD, side].response["mode"] = "LIVE"
         rejected = self.run_case(rel).decisions[0]
         self.assertEqual(rejected.primary_request_id, rejected.buy_request_id)
+
+
+def gas_fixture(direction):
+    """Both directions use synthetic native gas at 1/2 settlement atom per gas atom."""
+    rel, ctx, calls = fixtures()
+    dex_side = "BUY" if direction == REVERSE else "SELL"
+    gas = deepcopy(calls[REVERSE, "BUY"].response["includedCosts"][0])
+    rel = replace(rel, dex=replace(rel.dex, sell_costs=rel.dex.buy_costs))
+    calls = {slot: call for slot, call in calls.items() if slot[0] == direction}
+    dex = calls[direction, dex_side].response
+    # SELL receives gross minus three atoms. BUY pays gross plus three atoms.
+    if dex_side == "SELL":
+        dex["grossSettlementUnits"] = str(int(dex["settlementUnits"]) + 3)
+    dex["includedCosts"] = [gas]
+    return rel, ctx, calls, dex
+
+
+def evaluate(guard, rel, ctx, calls):
+    detector = OpportunityDetector(guard, lambda _: nullcontext(ctx))
+    detector.register(rel)
+    return detector.evaluate(rel.relationship_id, calls).execution_request
+
+
+@pytest.mark.parametrize("direction", [FORWARD, REVERSE])
+def test_admission_rejects_valid_same_final_substitution_after_restart(direction, tmp_path):
+    rel, ctx, calls, dex = gas_fixture(direction)
+    path = tmp_path / "guard.db"
+    with closing(ExecutionGuard(path)) as guard:
+        original = evaluate(guard, rel, ctx, calls)
+        assert original is not None
+
+    # A different fully reconciling quote for the same IDs, epochs, observation and profit.
+    dex["includedCosts"][0].update(units="7", settlementCostUnits="4")
+    delta = -1 if dex["side"] == "BUY" else 1
+    dex["grossSettlementUnits"] = str(int(dex["grossSettlementUnits"]) + delta)
+    with closing(ExecutionGuard(":memory:")) as alternate:
+        substitute = evaluate(alternate, rel, ctx, calls)
+        assert alternate.verify_pending(substitute) == substitute
+    key = dex["side"].lower()
+    accepted_leg, changed_leg = getattr(original, key), getattr(substitute, key)
+    assert (original.execution_id, original.net_profit, accepted_leg.settlement) == (
+        substitute.execution_id,
+        substitute.net_profit,
+        changed_leg.settlement,
+    )
+    assert changed_leg.gross_settlement.units == accepted_leg.gross_settlement.units + delta
+    assert (accepted_leg.costs[0].native, changed_leg.costs[0].native) == (
+        Amount(5, 0),
+        Amount(7, 0),
+    )
+
+    with closing(ExecutionGuard(path)) as guard:
+        assert guard.verify_pending(substitute) is None
+        assert evaluate(guard, rel, ctx, calls) is None
+        recovered = guard.read_pending(original.execution_id)
+        assert recovered == guard.verify_pending(original) == original
+        assert recovered is not original
+        cost = getattr(recovered, key).costs[0]
+        assert (cost.asset_id, cost.native, cost.settlement_units) == ("sim-b/gas", Amount(5, 0), 3)
+        assert (cost.numerator, cost.denominator, cost.rate_ref) == (1, 2, "sim-rate-1")
+        assert cost.rate == ctx.rates["sim-rate-1"]
+        assert accepted_leg.quote_expires_ms == accepted_leg.observed_ms + rel.dex.max_age_ms
+        assert original.expires_ms == accepted_leg.expires_ms == cost.rate.expires_ms
+        assert cost.rate.observed_ms <= original.evaluated_ms < cost.rate.expires_ms
+        with pytest.raises(FrozenInstanceError):
+            cost.rate.source = "changed"
+        assert guard.resolve(original.execution_id)
+        assert guard.verify_pending(original) is None
+        assert guard.read_pending(original.execution_id) is None
+        assert evaluate(guard, rel, ctx, calls) is None
+
+
+@pytest.mark.parametrize("direction", [FORWARD, REVERSE])
+def test_verification_binds_each_field_and_the_trusted_rate(direction):
+    rel, ctx, calls, dex = gas_fixture(direction)
+    with closing(ExecutionGuard(":memory:")) as guard:
+        request = evaluate(guard, rel, ctx, calls)
+        key = dex["side"].lower()
+        leg = getattr(request, key)
+        gas = leg.costs[0]
+        # An alternate trusted context authorizes the same conversion at a different observation.
+        revised = replace(gas.rate, observed_ms=gas.rate.observed_ms + 1)
+        ctx.rates[gas.rate_ref] = revised
+        with closing(ExecutionGuard(":memory:")) as alternate:
+            different_proof = evaluate(alternate, rel, ctx, calls)
+        assert getattr(different_proof, key).costs[0].rate == revised
+        assert guard.verify_pending(different_proof) is None
+
+        changes = [
+            replace(leg, costs=(replace(gas, **fields),))
+            for fields in (
+                {"rate_ref": "other"},
+                {"numerator": 2},
+                {"denominator": 3},
+                {"asset_id": "other"},
+                {"native": Amount(5, 1)},
+                {"cost_id": "other"},
+                {"settlement_units": 4},
+                {"rate": None},
+                {"rate": replace(gas.rate, source="other")},
+                {"rate": replace(gas.rate, expires_ms=gas.rate.expires_ms + 1)},
+                {"rate": replace(gas.rate, settlement_id="other")},
+                {"rate": replace(gas.rate, scale=False)},
+            )
+        ]
+        changes.extend(
+            replace(leg, **fields)
+            for fields in (
+                {"epoch": "other"},
+                {"market": replace(leg.market, source_id="other")},
+                {"request_id": "other"},
+                {"observed_ms": leg.observed_ms + 1},
+                {"expires_ms": leg.expires_ms + 1},
+                {"quote_expires_ms": leg.quote_expires_ms + 1},
+                {"settlement": Amount(1, 2)},
+                {"gross_settlement": Amount(2, 2)},
+                {"costs": ()},
+            )
+        )
+        for changed in changes:
+            assert guard.verify_pending(replace(request, **{key: changed})) is None
+        for fields in (
+            {"execution_id": "unknown"},
+            {"relationship_id": "other"},
+            {"mapping_revision": "other"},
+            {"fee_policy_id": "other"},
+            {"direction": REVERSE if direction == FORWARD else FORWARD},
+            {"buy": request.sell, "sell": request.buy},
+            {"status": "PENDING"},
+            {"mode": "LIVE"},
+            {"net_profit": Amount(0, 0)},
+            {"threshold": Amount(0, 0)},
+            {"evaluated_ms": request.evaluated_ms - 1},
+            {"expires_ms": request.expires_ms + 1},
+        ):
+            assert guard.verify_pending(replace(request, **fields)) is None
+        assert guard.verify_pending(request) == request
+
+
+def test_legacy_pending_claim_fails_closed_and_remains_spent(tmp_path):
+    path = tmp_path / "legacy.db"
+    rel, ctx, calls, _ = gas_fixture(REVERSE)
+    with closing(ExecutionGuard(":memory:")) as shadow:
+        request = evaluate(shadow, rel, ctx, calls)
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("""CREATE TABLE opportunity_requests (
+            execution_id TEXT PRIMARY KEY, relationship_id TEXT NOT NULL,
+            network TEXT NOT NULL, pending INTEGER NOT NULL,
+            buy_request_id TEXT NOT NULL, sell_request_id TEXT NOT NULL,
+            UNIQUE(relationship_id, buy_request_id, sell_request_id))""")
+        db.execute(
+            "INSERT INTO opportunity_requests VALUES (?, ?, ?, 1, ?, ?)",
+            (
+                request.execution_id,
+                rel.relationship_id,
+                rel.dex.market.network,
+                request.buy.request_id,
+                request.sell.request_id,
+            ),
+        )
+    with closing(ExecutionGuard(path)) as guard:
+        assert guard.pending() == (request.execution_id,)
+        assert guard.read_pending(request.execution_id) is None
+        assert guard.verify_pending(request) is None
+        assert evaluate(guard, rel, ctx, calls) is None
+        assert guard.resolve(request.execution_id)
+        assert evaluate(guard, rel, ctx, calls) is None
+
+
+def test_evidence_write_failure_rolls_back_claim_and_allows_retry(tmp_path):
+    path = tmp_path / "atomic.db"
+    rel, ctx, calls, _ = gas_fixture(REVERSE)
+    with closing(ExecutionGuard(path)) as guard, closing(sqlite3.connect(path)) as db:
+        db.execute("""CREATE TRIGGER fail_write BEFORE INSERT ON opportunity_admissions
+                      BEGIN SELECT RAISE(ABORT, 'fixture failure'); END""")
+        with pytest.raises(sqlite3.IntegrityError, match="fixture failure"):
+            evaluate(guard, rel, ctx, calls)
+        assert guard.pending() == ()
+        db.execute("DROP TRIGGER fail_write")
+        request = evaluate(guard, rel, ctx, calls)
+        assert request is not None and guard.verify_pending(request) == request
+
+
+def test_concurrent_admissions_keep_only_winning_evidence(tmp_path):
+    path = tmp_path / "contended.db"
+    rel, ctx, calls, _ = gas_fixture(REVERSE)
+    alternative = deepcopy(calls)
+    dex = alternative[REVERSE, "BUY"].response
+    dex["includedCosts"][0].update(units="7", settlementCostUnits="4")
+    dex["grossSettlementUnits"] = "9999"
+    with closing(ExecutionGuard(path)) as first, closing(ExecutionGuard(path)) as second:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            attempts = [
+                pool.submit(evaluate, guard, rel, ctx, inputs)
+                for guard, inputs in ((first, calls), (second, alternative))
+            ]
+        winners = [r for future in attempts if (r := future.result()) is not None]
+        assert len(winners) == 1
+        winner = winners[0]
+        assert first.read_pending(winner.execution_id) == second.verify_pending(winner) == winner
+
+
+def test_admission_recovers_embedded_and_settlement_costs_in_quote_order():
+    rel, ctx, calls, dex = gas_fixture(REVERSE)
+    market = rel.dex.market
+    embedded = Cost("pool", "EMBEDDED")
+    charge = Cost("settlement-fee", "SEPARATE", market.settlement_id, market.settlement_scale)
+    rel = replace(rel, dex=replace(rel.dex, buy_costs=(embedded, charge, *rel.dex.buy_costs)))
+    dex["includedCosts"].extend(
+        (
+            {"costId": "pool", "treatment": "EMBEDDED", "settlementCostUnits": "15"},
+            {
+                "costId": "settlement-fee",
+                "treatment": "SEPARATE",
+                "settlementCostUnits": "0",
+                "units": "0",
+                "assetId": market.settlement_id,
+                "scale": 2,
+                "rateNumerator": "2",
+                "rateDenominator": "2",
+            },
+        )
+    )
+    with closing(ExecutionGuard(":memory:")) as guard:
+        request = evaluate(guard, rel, ctx, calls)
+        recovered = guard.verify_pending(request)
+        gas, pool, fee = recovered.buy.costs
+        assert (gas.cost_id, pool.cost_id, fee.cost_id) == ("gas", "pool", "settlement-fee")
+        assert (pool.treatment, pool.settlement_units) == ("EMBEDDED", 15)
+        assert (fee.native, fee.numerator, fee.denominator) == (Amount(0, 2), 2, 2)
+        assert fee.rate_ref is None and fee.rate is None
+        assert (
+            guard.verify_pending(replace(request, buy=replace(request.buy, costs=(fee, gas, pool))))
+            is None
+        )

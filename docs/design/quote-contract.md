@@ -311,3 +311,45 @@
 تنها ورودی موجود در کش به `SIMULATION` تعلق دارد و مصرف‌کننده تصمیم `LIVE` می‌خواهد. جست‌وجو با کلید `LIVE` نتیجه‌ای ندارد. دادهٔ `SIMULATION` برای این تصمیم واجد شرایط نیست و فرصتی تولید نمی‌شود.
 
 S1 برای بازنگری ۲ تأیید ۳۷ از ۳۷ گزاره را با داده‌های JSON سند، ساعت ثابت و حساب صحیح گزارش کرد. بازتولید دقیق آن اجرا به برنامهٔ آزمون اصلی و فهرست گزاره‌های آن نیاز دارد. شواهد این سند به طراحی و نمونه‌ها محدودند. اعتبارسنجی اتصال واقعی، مدل قیمت‌گذاری تولید، ساعت همگام، هم‌زمانی و جداسازی عملیاتی پس از پیاده‌سازی موضوع آزمون مستقل‌اند.
+
+## S2 → S3 simulation admission, version 1
+
+S2 validates each leg under the pinned decision context. The admitted
+`ExecutionRequest` binds the execution ID, relationship, direction, mapping
+revision, fee policy, both market identities and request IDs, base volumes,
+profit, threshold, decision time, expiry, mode and status.
+
+The evidence types are defined in `arb_multidex.opportunity.models`.
+On each leg, `gross_settlement` includes embedded fees and `settlement` is the
+final payment or receipt. `costs` is an immutable tuple in accepted quote order.
+Each component records its ID, treatment and settlement atoms. A `SeparateCost`
+also carries `asset_id`, `native` (integer units and scale), and the exact
+`numerator` and `denominator` used for conversion. For a foreign asset,
+`rate_ref` identifies the frozen `rate` observation that S2 checked, including
+its trusted source, both assets and scales, fraction, observation and exclusive
+expiry. A settlement-asset conversion has a unit ratio and both references are
+`None`. The quote source, epoch, observation and age deadline are available as
+`market.source_id`, `epoch`, `observed_ms` and `quote_expires_ms`. The effective
+leg expiry also accounts for rate expiry. All timestamps are UTC epoch milliseconds.
+
+The detector inserts the versioned canonical payload and the existing unique
+claim in one SQLite transaction. S2 owns admission writes. The orchestrator
+supplies S3 with the trusted guard for this simulation. Retain the file across
+restarts and restrict writes to trusted application code.
+
+- Before a first reservation, call `accepted = guard.verify_pending(request)`.
+  A match returns an immutable request reconstructed from the journal. Use
+  that returned value for accounting. A missing, changed, resolved or legacy
+  ID-only submission returns `None` and cannot authorize a reservation.
+- For recovery by ID, `guard.read_pending(execution_id)` returns the same
+  typed evidence. Legacy pending IDs remain visible through `guard.pending()`
+  for reconciliation. The original evidence cannot be reconstructed from those IDs.
+- For a DEX BUY use `accepted.buy`, and for a DEX SELL use `accepted.sell`.
+  Book gross settlement and charge each separate native cost once. Embedded
+  fees are already reflected in gross settlement. The journal supplies all
+  evidence needed from the accepted quote.
+- Verification is repeatable while pending. S3 serializes first reservation
+  and resolution under its execution-ID idempotency rules, checks freshness
+  at reservation, and resolves after reconciliation. For an already journaled
+  run, S3 compares the exact request to its own durable record before returning
+  its previous result. Resolution permanently spends the S2 claim.

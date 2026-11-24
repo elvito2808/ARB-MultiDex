@@ -3,7 +3,19 @@
 import hashlib
 import json
 import sqlite3
+from dataclasses import asdict
 from threading import Lock
+
+from .models import (
+    AcceptedCost,
+    Amount,
+    Direction,
+    ExecutionRequest,
+    Leg,
+    Market,
+    Rate,
+    SeparateCost,
+)
 
 
 def execution_id(relationship, direction, buy, sell):
@@ -20,6 +32,50 @@ def execution_id(relationship, direction, buy, sell):
         ],
     ]
     return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+
+def _payload(request):
+    # Canonical JSON keeps arbitrary-precision atoms and distinguishes bool from int.
+    return json.dumps(
+        {"version": 1, "request": asdict(request)},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _read_cost(record):
+    if record["treatment"] == "EMBEDDED":
+        return AcceptedCost(**record)
+    if record["treatment"] != "SEPARATE":
+        raise ValueError("unknown admitted cost treatment")
+    record["native"] = Amount(**record["native"])
+    if record["rate"] is not None:
+        record["rate"] = Rate(**record["rate"])
+    return SeparateCost(**record)
+
+
+def _read_leg(record):
+    record["market"] = Market(**record["market"])
+    for field in ("base", "settlement", "gross_settlement"):
+        record[field] = Amount(**record[field])
+    record["costs"] = tuple(_read_cost(c) for c in record["costs"])
+    return Leg(**record)
+
+
+def _read_request(payload, execution_id):
+    admission = json.loads(payload)
+    if type(admission["version"]) is not int or admission["version"] != 1:
+        raise ValueError("unsupported S2 admission version")
+    record = admission["request"]
+    if record["execution_id"] != execution_id:
+        raise ValueError("S2 admission ID differs from its journal key")
+    record["direction"] = Direction(record["direction"])
+    for field in ("buy", "sell"):
+        record[field] = _read_leg(record[field])
+    for field in ("net_profit", "threshold"):
+        record[field] = Amount(**record[field])
+    return ExecutionRequest(**record)
 
 
 class ExecutionGuard:
@@ -43,7 +99,16 @@ class ExecutionGuard:
                     ON opportunity_requests({column}) WHERE pending = 1
                 """)
 
-    def admit(self, request, network):
+            # A separate insert-only table also works with existing ID-only journals.
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS opportunity_admissions (
+                    execution_id TEXT PRIMARY KEY REFERENCES opportunity_requests(execution_id),
+                    payload TEXT NOT NULL
+                )
+            """)
+
+    def _admit(self, request, network):
+        """S2 detector write path. Commit validated evidence and its claim together."""
         with self._lock, self._db:
             cursor = self._db.execute(
                 "INSERT INTO opportunity_requests VALUES (?, ?, ?, 1, ?, ?) ON CONFLICT DO NOTHING",
@@ -55,7 +120,38 @@ class ExecutionGuard:
                     request.sell.request_id,
                 ),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount == 0:
+                return False
+            self._db.execute(
+                "INSERT INTO opportunity_admissions (execution_id, payload) VALUES (?, ?)",
+                (request.execution_id, _payload(request)),
+            )
+            return True
+
+    def _pending_payload(self, execution_id):
+        with self._lock:
+            row = self._db.execute(
+                "SELECT payload FROM opportunity_requests JOIN opportunity_admissions "
+                "USING (execution_id) WHERE execution_id = ? AND pending = 1",
+                (execution_id,),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def read_pending(self, execution_id: str) -> ExecutionRequest | None:
+        """Read immutable evidence for recovery. Legacy ID-only claims have no evidence."""
+        payload = self._pending_payload(execution_id)
+        return None if payload is None else _read_request(payload, execution_id)
+
+    def verify_pending(self, request: ExecutionRequest) -> ExecutionRequest | None:
+        """Return the journal's typed copy only on an exact pending match. Read-only."""
+        if type(request) is not ExecutionRequest or type(request.execution_id) is not str:
+            return None
+        try:
+            supplied = _payload(request)
+        except (TypeError, ValueError, RecursionError):
+            return None
+        stored = self._pending_payload(request.execution_id)
+        return _read_request(stored, request.execution_id) if stored == supplied else None
 
     def pending(self):
         """Unresolved IDs (including after restart) for S3 reconciliation."""
