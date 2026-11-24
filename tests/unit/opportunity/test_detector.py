@@ -105,11 +105,15 @@ class DetectorTest(unittest.TestCase):
         )
         self.assertEqual(self.guard.pending(), (req.execution_id,))
 
-    def test_strict_threshold_equality_and_one_atom(self):
+    def test_inclusive_threshold_equality_and_one_atom(self):
         del self.calls[FORWARD, "BUY"]
-        for threshold, accepted in ((242, False), (243, False), (241, True)):
+        for threshold, accepted in ((242, True), (243, False), (241, True)):
             with self.subTest(threshold=threshold):
                 terms = replace(self.rel.buy_dex, threshold=Amount(threshold, 2))
+                # Each threshold case is an independent evaluation; do not reuse a
+                # spent snapshot claim from the previous subtest.
+                self.guard = ExecutionGuard(":memory:")
+                self.addCleanup(self.guard.close)
                 result = self.run_case(replace(self.rel, buy_dex=terms))
                 self.assertEqual(result.decisions[1].qualifies, accepted)
                 self.assertEqual(result.execution_request is not None, accepted)

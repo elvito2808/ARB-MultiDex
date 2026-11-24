@@ -66,7 +66,7 @@ def compare(relationship, direction, buy, sell):
     scale = max(a.settlement.scale, b.settlement.scale, terms.threshold.scale)
     profit = b.settlement.at(scale) - a.settlement.at(scale)
     return replace(
-        decision, net_profit=Amount(profit, scale), qualifies=profit > terms.threshold.at(scale)
+        decision, net_profit=Amount(profit, scale), qualifies=profit >= terms.threshold.at(scale)
     )
 
 
