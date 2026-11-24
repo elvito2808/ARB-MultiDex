@@ -1,0 +1,28 @@
+# Each entry is an independent SIM-01 producer binding. S4 may pass a parsed
+# entry to arb_multidex.quotes.config.build_market. Share the feed across
+# relationship bindings to retain a single market epoch and accepted watermark.
+dex:
+  venue: saucerswap-v1
+  provider: mock
+  mode: SIMULATION
+  relationship_id: fixture-dex
+  mapping_revision: fixture-1
+  fee_policy_id: fixture-pool-and-gas
+  base_units: 100000000   # one WHBAR in both directions
+  max_age_ms: 5000       # example policy
+  rpc_endpoints: []      # required for public reads, in failover order
+  gas_rate_source: null  # public quotes also need a trusted, time-bound estimate
+kucoin:
+  venue: kucoin-spot
+  provider: mock
+  mode: SIMULATION
+  relationship_id: fixture-spot
+  mapping_revision: fixture-1
+  fee_policy_id: fixture-spot-fee
+  mock_symbol: TEST-USDT
+  symbol: null           # set the public market and its scales explicitly
+  base_scale: 8
+  settlement_scale: 6
+  base_units: 100000000
+  max_age_ms: 5000
+  settlement_fee_bps: 10 # explicit mock settlement-asset fee policy
