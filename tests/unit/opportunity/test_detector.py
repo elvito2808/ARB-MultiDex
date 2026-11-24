@@ -1,5 +1,6 @@
 """Offline test fixtures. All markets, mappings, volumes, fees and limits are synthetic."""
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -8,7 +9,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 from threading import Event
 
@@ -29,6 +30,7 @@ from arb_multidex.opportunity import (
     SourceState,
     Terms,
 )
+from arb_multidex.opportunity.guard import AdmissionEvidenceError, LegacyAdmission
 
 FORWARD, REVERSE = Direction.BUY_KUCOIN, Direction.BUY_DEX
 ROOT = Path(__file__).resolve().parents[3]
@@ -693,7 +695,7 @@ def test_legacy_pending_claim_fails_closed_and_remains_spent(tmp_path):
         )
     with closing(ExecutionGuard(path)) as guard:
         assert guard.pending() == (request.execution_id,)
-        assert guard.read_pending(request.execution_id) is None
+        assert guard.read_pending(request.execution_id) == LegacyAdmission(request.execution_id)
         assert guard.verify_pending(request) is None
         assert evaluate(guard, rel, ctx, calls) is None
         assert guard.resolve(request.execution_id)
@@ -766,3 +768,277 @@ def test_admission_recovers_embedded_and_settlement_costs_in_quote_order():
             guard.verify_pending(replace(request, buy=replace(request.buy, costs=(fee, gas, pool))))
             is None
         )
+
+
+def canonical(record):
+    return json.dumps(record, separators=(",", ":"), sort_keys=True)
+
+
+def pending_fixture(path, direction=REVERSE):
+    rel, ctx, calls, _ = gas_fixture(direction)
+    with closing(ExecutionGuard(path)) as guard:
+        request = evaluate(guard, rel, ctx, calls)
+    assert request is not None
+    return request
+
+
+def write_evidence(path, claim_id, payload, *, update_digest):
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "UPDATE opportunity_admissions SET payload=? WHERE execution_id=?", (payload, claim_id)
+        )
+        if update_digest:
+            # Exercise semantic validation even when the stored bytes match the claim's digest.
+            db.execute(
+                "UPDATE opportunity_requests SET evidence_digest=? WHERE execution_id=?",
+                (hashlib.sha256(payload.encode()).hexdigest(), claim_id),
+            )
+
+
+def assert_invalid_evidence(path, request, supplied=None):
+    with closing(ExecutionGuard(path)) as guard:
+        with pytest.raises(AdmissionEvidenceError) as error:
+            guard.read_pending(request.execution_id)
+        assert error.value.execution_id == request.execution_id
+        for candidate in (supplied or request, replace(request, mapping_revision="mismatch")):
+            with pytest.raises(AdmissionEvidenceError):
+                guard.verify_pending(candidate)
+        assert guard.pending() == (request.execution_id,)
+
+
+MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("version", 2),
+        ("version", True),
+        ("version", MISSING),
+        ("extra", "extra"),
+        ("request", []),
+        ("request.status", MISSING),
+        ("request.mode", "LIVE"),
+        ("request.status", "PENDING"),
+        ("request.relationship_id", ""),
+        ("request.fee_policy_id", None),
+        ("request.mapping_revision", "illegal token"),
+        ("request.direction", "BUY"),
+        ("request.execution_id", "another"),
+        ("request.evaluated_ms", None),
+        ("request.evaluated_ms", False),
+        ("request.evaluated_ms", "0"),
+        ("request.evaluated_ms", T0 - 1),
+        ("request.evaluated_ms", T0 + 4500),
+        ("request.expires_ms", None),
+        ("request.expires_ms", True),
+        ("request.expires_ms", T0 + 4501),
+        ("request.buy.quote_expires_ms", None),
+        ("request.buy.quote_expires_ms", 1.5),
+        ("request.buy.observed_ms", MISSING),
+        ("request.buy.observed_ms", True),
+        ("request.buy.observed_ms", T0 + 3000),
+        ("request.buy.expires_ms", T0 + 4400),
+        ("request.sell.quote_expires_ms", T0),
+        ("request.sell.expires_ms", None),
+        ("request.buy.mode", "LIVE"),
+        ("request.sell.side", "BUY"),
+        ("request.sell.request_id", "q3"),
+        ("request.buy.epoch", []),
+        ("request.buy.base", []),
+        ("request.buy.base.units", True),
+        ("request.buy.base.units", 0),
+        ("request.buy.base.units", 10**78),
+        ("request.buy.base.scale", 39),
+        ("request.sell.base.units", 201),
+        ("request.sell.settlement.scale", 3),
+        ("request.buy.gross_settlement.units", -1),
+        ("request.buy.gross_settlement.units", 10001),
+        ("request.sell.settlement.units", 0),
+        ("request.sell.gross_settlement.units", 10246),
+        ("request.buy.market", None),
+        ("request.buy.market.source_id", "other"),
+        ("request.buy.market.network", None),
+        ("request.buy.market.pool", {}),
+        ("request.sell.market.symbol", ""),
+        ("request.buy.market.venue", False),
+        ("request.buy.market.symbol", MISSING),
+        ("request.buy.market.extra", 0),
+        ("request.buy.market.base_scale", True),
+        ("request.buy.market.settlement_id", "sim-b/asset-x"),
+        ("request.direction", FORWARD),
+        ("request.buy.costs", {}),
+        ("request.buy.costs.0.treatment", "OTHER"),
+        ("request.buy.costs.0.cost_id", "invalid id"),
+        ("request.buy.costs.0.extra", 1),
+        ("request.buy.costs.0.native.units", 7),
+        ("request.buy.costs.0.native.scale", False),
+        ("request.buy.costs.0.asset_id", "sim-b/asset-x"),
+        ("request.buy.costs.0.settlement_units", True),
+        ("request.buy.costs.0.numerator", 0),
+        ("request.buy.costs.0.denominator", False),
+        ("request.buy.costs.0.denominator", 0),
+        ("request.buy.costs.0.rate_ref", None),
+        ("request.buy.costs.0.rate", None),
+        ("request.buy.costs.0.rate.scale", False),
+        ("request.buy.costs.0.rate.settlement_scale", 4),
+        ("request.buy.costs.0.rate.source", {}),
+        ("request.buy.costs.0.rate.observed_ms", None),
+        ("request.buy.costs.0.rate.expires_ms", True),
+        ("request.buy.costs.0.rate.observed_ms", T0 + 2100),
+        ("request.buy.costs.0.rate.expires_ms", T0 + 2000),
+        ("request.buy.costs.0.rate.observed_ms", MISSING),
+        ("request.buy.costs.0.rate.numerator", False),
+        ("request.buy.costs.0.rate.numerator", 2),
+        ("request.buy.costs.0.rate.denominator", -1),
+        ("request.buy.costs.0.rate.asset_id", "other"),
+        ("request.buy.costs.0.rate.settlement_id", "other"),
+        ("request.sell.costs.0.native", {}),
+        ("request.sell.costs.0.settlement_units", False),
+        ("request.threshold.units", -1),
+        ("request.threshold.units", 243),
+        ("request.net_profit.units", 0),
+        ("request.net_profit.scale", 1),
+        ("request.extra", "ignored?"),
+    ],
+)
+def test_semantically_invalid_persisted_fields_fail_closed(tmp_path, path, value):
+    journal = tmp_path / "guard.db"
+    request = pending_fixture(journal)
+    data = {"version": 1, "request": asdict(request)}
+    node = data
+    *parents, key = path.split(".")
+    for parent in parents:
+        node = node[int(parent) if parent.isdigit() else parent]
+    if value is MISSING:
+        del node[key]
+    else:
+        node[key] = value
+    write_evidence(journal, request.execution_id, canonical(data), update_digest=True)
+    exact_null = (
+        replace(request, evaluated_ms=None)
+        if path == "request.evaluated_ms" and value is None
+        else None
+    )
+    assert_invalid_evidence(journal, request, exact_null)
+
+
+@pytest.mark.parametrize("invalid", ["{", "null", "[]", '{"version":1}', '{"version":NaN}'])
+def test_malformed_admission_is_a_typed_error(tmp_path, invalid):
+    path = tmp_path / "guard.db"
+    request = pending_fixture(path)
+    write_evidence(path, request.execution_id, invalid, update_digest=True)
+    assert_invalid_evidence(path, request)
+
+
+def test_duplicate_json_field_rejected(tmp_path):
+    path = tmp_path / "guard.db"
+    request = pending_fixture(path)
+    raw = canonical({"version": 1, "request": asdict(request)})
+    raw = raw.replace('"version":1', '"version":1,"version":1')
+    write_evidence(path, request.execution_id, raw, update_digest=True)
+    assert_invalid_evidence(path, request)
+
+
+def test_evidence_claim_cannot_be_recovered_as_legacy_or_replaced(tmp_path):
+    path = tmp_path / "guard.db"
+    request = pending_fixture(path)
+    # A consistent replacement (including rate) still differs from the admitted bytes.
+    data = asdict(request)
+    data["buy"]["costs"][0]["rate_ref"] = "replacement"
+    write_evidence(
+        path, request.execution_id, canonical({"version": 1, "request": data}), update_digest=False
+    )
+    assert_invalid_evidence(path, request)
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("DELETE FROM opportunity_admissions")
+    assert_invalid_evidence(path, request)
+    with closing(ExecutionGuard(path)) as guard:
+        rel, ctx, calls, _ = gas_fixture(REVERSE)
+        assert evaluate(guard, rel, ctx, calls) is None
+
+
+def test_revision_one_mixed_journal_migration(tmp_path):
+    path = tmp_path / "rev1.db"
+    request = pending_fixture(path)
+    # Restore the exact Revision 1 claim schema. At upgrade an ID without evidence
+    # could have been a legacy claim, or could have lost its payload.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("ALTER TABLE opportunity_requests DROP COLUMN evidence_digest")
+        db.execute(
+            "INSERT INTO opportunity_requests VALUES ('ambiguous','other','other',1,'a','b')"
+        )
+    for _ in range(2):
+        with closing(ExecutionGuard(path)) as guard:
+            assert guard.read_pending(request.execution_id) == request
+            assert guard.verify_pending(request) == request
+            with pytest.raises(AdmissionEvidenceError):
+                guard.read_pending("ambiguous")
+            assert guard.pending() == tuple(sorted((request.execution_id, "ambiguous")))
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "DELETE FROM opportunity_admissions WHERE execution_id=?", (request.execution_id,)
+        )
+    with closing(ExecutionGuard(path)) as guard:
+        for claim_id in (request.execution_id, "ambiguous"):
+            with pytest.raises(AdmissionEvidenceError):
+                guard.read_pending(claim_id)
+
+
+def test_mismatch_and_missing_or_resolved_id_do_not_identify_a_legacy_claim(tmp_path):
+    path = tmp_path / "guard.db"
+    request = pending_fixture(path)
+    with closing(ExecutionGuard(path)) as guard:
+        assert guard.read_pending("absent") is None
+        assert guard.verify_pending(replace(request, evaluated_ms=None)) is None
+        assert guard.verify_pending(replace(request, direction=request.direction.value)) is None
+        assert guard.verify_pending(replace(request, sell=asdict(request.sell))) is None
+        assert guard.pending() == (request.execution_id,)
+        assert guard.verify_pending(request) == request
+        assert guard.resolve(request.execution_id)
+        assert guard.read_pending(request.execution_id) is None
+
+
+@pytest.mark.parametrize("storage_encoding", ["UTF-8", "UTF-16le", "UTF-16be"])
+def test_revision_one_digest_uses_actual_stored_bytes(tmp_path, storage_encoding):
+    path = tmp_path / "storage.db"
+    with closing(sqlite3.connect(path)) as db:
+        db.execute(f"PRAGMA encoding='{storage_encoding}'")
+        db.execute("CREATE TABLE encoding_fixture (id INTEGER)")
+    request = pending_fixture(path)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("ALTER TABLE opportunity_requests DROP COLUMN evidence_digest")
+    with closing(ExecutionGuard(path)) as guard:
+        assert guard.read_pending(request.execution_id) == request
+        assert guard.verify_pending(request) == request
+
+
+@pytest.mark.parametrize(
+    "change", ["asset", "identity-rate", "duplicate", "claim-network", "conflicting-rate-ref"]
+)
+def test_inconsistent_persisted_costs_or_claim_identity(tmp_path, change):
+    path = tmp_path / "guard.db"
+    request = pending_fixture(path)
+    data = asdict(request)
+    leg = data["buy"]
+    gas = leg["costs"][0]
+    if change in ("asset", "identity-rate"):
+        gas.update(asset_id=leg["market"]["settlement_id"], native={"units": 3, "scale": 2})
+        if change == "identity-rate":
+            gas.update(rate=None, rate_ref=None)  # Settlement fraction still 1/2.
+        else:
+            gas.update(numerator=1, denominator=1)  # Spurious foreign observation.
+    elif change in ("duplicate", "conflicting-rate-ref"):
+        other = deepcopy(gas)
+        other["native"]["units"] = other["settlement_units"] = 0
+        if change == "conflicting-rate-ref":
+            other["cost_id"] = "second"
+            other["rate"]["source"] = "different-oracle"
+        leg["costs"] = [gas, other]
+    else:
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("UPDATE opportunity_requests SET network='other'")
+    write_evidence(
+        path, request.execution_id, canonical({"version": 1, "request": data}), update_digest=True
+    )
+    assert_invalid_evidence(path, request)

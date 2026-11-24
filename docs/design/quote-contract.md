@@ -332,18 +332,47 @@ expiry. A settlement-asset conversion has a unit ratio and both references are
 `market.source_id`, `epoch`, `observed_ms` and `quote_expires_ms`. The effective
 leg expiry also accounts for rate expiry. All timestamps are UTC epoch milliseconds.
 
-The detector inserts the versioned canonical payload and the existing unique
-claim in one SQLite transaction. S2 owns admission writes. The orchestrator
-supplies S3 with the trusted guard for this simulation. Retain the file across
-restarts and restrict writes to trusted application code.
+### Journal migration and evidence classification
 
-- Before a first reservation, call `accepted = guard.verify_pending(request)`.
-  A match returns an immutable request reconstructed from the journal. Use
-  that returned value for accounting. A missing, changed, resolved or legacy
-  ID-only submission returns `None` and cannot authorize a reservation.
-- For recovery by ID, `guard.read_pending(execution_id)` returns the same
-  typed evidence. Legacy pending IDs remain visible through `guard.pending()`
-  for reconciliation. The original evidence cannot be reconstructed from those IDs.
+The detector commits the unique claim, a SHA-256 digest of the canonical
+version 1 payload bytes in the database text encoding, and the payload itself in the same SQLite transaction.
+The digest lives on the claim, so deleting or replacing its payload is
+detectable. Keep the journal under trusted application control.
+
+On first open, a single SQLite write transaction inspects the existing schema,
+adds the claim marker and classifies existing rows before admitting new writes.
+
+| Journal at upgrade | Classification |
+| --- | --- |
+| Original ID-only schema | Existing claims receive an explicit legacy marker. Their accepted financial evidence cannot be recovered. |
+| Revision 1 schema with a stored text payload | The claim receives a digest of the existing bytes. Every recovery or verification still validates the complete payload. |
+| Revision 1 schema with absent or unreadable evidence | Provenance is unknown. The claim stays unavailable for execution and requires reconciliation. |
+
+Subsequent opens preserve the markers. Migration relies on an intact schema
+and the contents available at upgrade. A digest created during migration
+cannot independently establish the prior history of a Revision 1 payload.
+
+### S3 recovery and first reservation
+
+Import `LegacyAdmission` and `AdmissionEvidenceError` from
+`arb_multidex.opportunity.guard`. Both lookups are read-only.
+
+| Claim state | `read_pending(execution_id)` | `verify_pending(request)` |
+| --- | --- | --- |
+| Valid evidence, pending | Immutable typed request | Journal request on an exact match, otherwise `None` |
+| Proven legacy, pending | `LegacyAdmission(execution_id)` | `None` |
+| Absent or resolved | `None` | `None` |
+| Missing, ambiguous, malformed, unsupported, inconsistent or unreadable evidence | Raises `AdmissionEvidenceError` | Raises `AdmissionEvidenceError` for the identified request, including a mismatched submission |
+
+For a first reservation, S3 uses the request returned by `verify_pending`.
+Recovery by ID uses `read_pending`. Reads check the digest, schema and types,
+claim and market identities, both legs, exact-cost arithmetic, profit threshold,
+and validity at the recorded decision time. S3 checks current freshness at use.
+Only the explicit legacy result identifies a legacy lost handoff. On an
+evidence error, record the diagnostic with its execution ID, keep the claim
+pending for reconciliation, and create no reservation or attempt. A mismatch
+leaves the genuine claim available for verification.
+
 - For a DEX BUY use `accepted.buy`, and for a DEX SELL use `accepted.sell`.
   Book gross settlement and charge each separate native cost once. Embedded
   fees are already reflected in gross settlement. The journal supplies all
