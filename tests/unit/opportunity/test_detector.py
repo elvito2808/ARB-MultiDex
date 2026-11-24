@@ -105,9 +105,9 @@ class DetectorTest(unittest.TestCase):
         )
         self.assertEqual(self.guard.pending(), (req.execution_id,))
 
-    def test_strict_threshold_equality_and_one_atom(self):
+    def test_inclusive_threshold_equality_and_one_atom(self):
         del self.calls[FORWARD, "BUY"]
-        for threshold, accepted in ((242, False), (243, False), (241, True)):
+        for threshold, accepted in ((242, True), (243, False), (241, True)):
             with self.subTest(threshold=threshold):
                 terms = replace(self.rel.buy_dex, threshold=Amount(threshold, 2))
                 result = self.run_case(replace(self.rel, buy_dex=terms))
