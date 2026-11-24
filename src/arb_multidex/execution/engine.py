@@ -72,6 +72,32 @@ def _run(db, execution_id):
     return row
 
 
+def _diagnose(db, execution_id, reason):
+    db.execute(
+        "INSERT INTO sim_admission_diagnostics VALUES (?,?) "
+        "ON CONFLICT(id) DO UPDATE SET reason=excluded.reason",
+        (execution_id, reason),
+    )
+    return Result(execution_id, "AWAITING_RECONCILIATION", reason, ())
+
+
+def _recovery_problem(db, run):
+    proof = db.execute("SELECT digest FROM sim_run_admissions WHERE id=?", (run["id"],)).fetchone()
+    reason = None
+    if proof is None or proof["digest"] != journal.admission_digest(run["request"], run["moves"]):
+        reason = "S2 admission provenance unproven; reconciliation required"
+    elif run["state"] in ACTIVE:
+        entries = json.loads(run["moves"]).values()
+        reason = journal.opening_problem(
+            db, ((account, asset) for leg in entries for account, asset, _ in leg)
+        )
+    if reason:
+        # Keep the original phase, so the active network/worker locks, attempts,
+        # holds and any confirmed fills survive manual reconciliation.
+        _diagnose(db, run["id"], reason)
+    return reason
+
+
 def _finish(db, run, state, reason=None):
     db.execute("DELETE FROM sim_holds WHERE id=?", (run["id"],))
     db.execute("UPDATE sim_runs SET state=?, reason=? WHERE id=?", (state, reason, run["id"]))
@@ -123,6 +149,15 @@ class SimulationEngine:
             status = (
                 "TRADING_PAUSED" if row["paused"] else "STOPPED" if row["stopped"] else "RUNNING"
             )
+            config = self.workers.get(worker)
+            if (
+                status == "RUNNING"
+                and config
+                and journal.opening_problem(
+                    db, ((account, asset) for account, asset, _ in config.assets)
+                )
+            ):
+                status = "AWAITING_RECONCILIATION"
             return WorkerState(status, row["incomplete"])
 
     def _fresh(self, evaluated, expires):
@@ -150,14 +185,8 @@ class SimulationEngine:
         )
 
     def _defer(self, error):
-        reason = str(error)
         with self.journal.transaction() as db:
-            db.execute(
-                "INSERT INTO sim_admission_diagnostics VALUES (?,?) "
-                "ON CONFLICT(id) DO UPDATE SET reason=excluded.reason",
-                (error.execution_id, reason),
-            )
-        return Result(error.execution_id, "AWAITING_RECONCILIATION", reason, ())
+            return _diagnose(db, error.execution_id, str(error))
 
     def submit(self, request: ExecutionRequest, *, plan=SUCCESS_PLAN):
         if (
@@ -195,12 +224,19 @@ class SimulationEngine:
                 config = self.workers.get(accepted.relationship_id)
                 if config is None:
                     return Result(execution_id, "REJECTED", "unknown relationship", ())
+                problem = journal.opening_problem(
+                    db, ((account, asset) for account, asset, _ in config.assets)
+                )
+                if problem:
+                    return _diagnose(db, execution_id, problem)
                 self._reserve_accepted(db, accepted, config, plan)
         return self.result(execution_id)
 
     def _reserve_accepted(self, db, request, config, plan):
         execution_id = request.execution_id
         worker = config.relationship_id
+        encoded = json.dumps(asdict(request), sort_keys=True)
+        stored_moves = "{}"
         db.execute(
             "INSERT INTO sim_runs(id, worker, network, request, moves, script, state) "
             "VALUES (?,?,?,?,?,?, 'REJECTED')",
@@ -208,8 +244,8 @@ class SimulationEngine:
                 execution_id,
                 worker,
                 config.dex.network,
-                json.dumps(asdict(request), sort_keys=True),
-                "{}",
+                encoded,
+                stored_moves,
                 json.dumps(asdict(plan)),
             ),
         )
@@ -233,13 +269,19 @@ class SimulationEngine:
         except ValueError as exc:
             db.execute("UPDATE sim_runs SET reason=? WHERE id=?", (str(exc), execution_id))
         else:
+            stored_moves = json.dumps(moves)
             db.execute(
                 "UPDATE sim_runs SET state='DEX', moves=?, gas_evidence=? WHERE id=?",
-                (json.dumps(moves), json.dumps(gas_evidence), execution_id),
+                (stored_moves, json.dumps(gas_evidence), execution_id),
             )
 
+        db.execute(
+            "INSERT INTO sim_run_admissions VALUES (?,?)",
+            (execution_id, journal.admission_digest(encoded, stored_moves)),
+        )
+
     def result(self, execution_id):
-        with self.journal.transaction(write=False) as db:
+        with self.journal.transaction() as db:
             if db.execute("SELECT 1 FROM sim_lost_handoffs WHERE id=?", (execution_id,)).fetchone():
                 return Result(execution_id, "REJECTED", "S2 handoff lost before execution", ())
             run = db.execute("SELECT * FROM sim_runs WHERE id=?", (execution_id,)).fetchone()
@@ -263,6 +305,9 @@ class SimulationEngine:
                 )
                 for r in rows
             )
+            problem = _recovery_problem(db, run)
+            if problem:
+                return Result(execution_id, "AWAITING_RECONCILIATION", problem, attempts)
             status = run["state"]
             if attempts and attempts[-1].status == "UNKNOWN":
                 status = "AWAITING_RECONCILIATION"
@@ -278,7 +323,7 @@ class SimulationEngine:
         """Commit at most one submission or status check. Safe for concurrent drivers."""
         with self.journal.transaction() as db:
             run = _run(db, execution_id)
-            if run["state"] in ACTIVE:
+            if run["state"] in ACTIVE and not _recovery_problem(db, run):
                 self._advance(db, run)
         return self.result(execution_id)
 
@@ -349,13 +394,15 @@ class SimulationEngine:
         if leg not in ACTIVE or outcome not in allowed:
             raise ValueError("invalid final receipt")
         with self.journal.transaction() as db:
-            changed = db.execute(
-                "UPDATE sim_attempts SET receipt=?,status='SUBMITTED' WHERE id=? AND leg=? "
-                "AND number=? AND status='UNKNOWN' AND receipt='UNKNOWN'",
-                (outcome, execution_id, leg, number),
-            ).rowcount
-            if changed != 1:
-                raise ValueError("no matching unknown attempt")
+            run = _run(db, execution_id)
+            if not _recovery_problem(db, run):
+                changed = db.execute(
+                    "UPDATE sim_attempts SET receipt=?,status='SUBMITTED' WHERE id=? AND leg=? "
+                    "AND number=? AND status='UNKNOWN' AND receipt='UNKNOWN'",
+                    (outcome, execution_id, leg, number),
+                ).rowcount
+                if changed != 1:
+                    raise ValueError("no matching unknown attempt")
         return self._drain(self.result(execution_id))
 
     def _drain(self, result):

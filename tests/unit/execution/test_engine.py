@@ -2,7 +2,7 @@
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from threading import Barrier
@@ -812,3 +812,277 @@ def test_replay_preserves_runtime_types_after_resolution(worker, factory, handof
 def test_first_submission_requires_shared_guard(worker, tmp_path):
     with pytest.raises(ValueError, match="shared S2 admission guard"):
         SimulationEngine(tmp_path / "s3.db", [worker], guard=None)
+
+
+# Offline snapshot from 27d63790's test_engine.handoff() and SimulationEngine.submit()
+# with an empty ExecutionGuard. The second snapshot differs only by two advance() calls.
+LEGACY_RESERVED = (
+    """BEGIN TRANSACTION;
+CREATE TABLE opportunity_requests (
+                    execution_id TEXT PRIMARY KEY, relationship_id TEXT NOT NULL,
+                    network TEXT NOT NULL, pending INTEGER NOT NULL,
+                    buy_request_id TEXT NOT NULL, sell_request_id TEXT NOT NULL,
+                    UNIQUE(relationship_id, buy_request_id, sell_request_id)
+                );
+CREATE TABLE sim_attempts (
+    id TEXT NOT NULL REFERENCES sim_runs, leg TEXT NOT NULL, number INTEGER NOT NULL CHECK(number BETWEEN 1 AND 3),
+    status TEXT NOT NULL, receipt TEXT NOT NULL, was_unknown INTEGER NOT NULL DEFAULT 0, changes TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY(id,leg,number)
+);
+CREATE TABLE sim_balances (
+    account TEXT NOT NULL, asset TEXT NOT NULL, scale INTEGER NOT NULL, units TEXT NOT NULL,
+    PRIMARY KEY(account,asset)
+);
+INSERT INTO "sim_balances" VALUES('dex/hedera-mainnet','0x0000000000000000000000000000000000163b5a',8,'100000000000');
+INSERT INTO "sim_balances" VALUES('dex/hedera-mainnet','0x000000000000000000000000000000000006f89a',6,'500000000');
+INSERT INTO "sim_balances" VALUES('dex/hedera-mainnet','hedera/295/HBAR',8,'1000000000');
+INSERT INTO "sim_balances" VALUES('kucoin','kucoin/HBAR',8,'100000000000');
+INSERT INTO "sim_balances" VALUES('kucoin','kucoin/USDT',6,'500000000');
+CREATE TABLE sim_holds (
+    id TEXT NOT NULL REFERENCES sim_runs, leg TEXT NOT NULL, account TEXT NOT NULL,
+    asset TEXT NOT NULL, units TEXT NOT NULL, PRIMARY KEY(id,leg,account,asset),
+    FOREIGN KEY(account,asset) REFERENCES sim_balances
+);
+INSERT INTO "sim_holds" VALUES('run','DEX','dex/hedera-mainnet','0x000000000000000000000000000000000006f89a','12000000');
+INSERT INTO "sim_holds" VALUES('run','DEX','dex/hedera-mainnet','hedera/295/HBAR','5');
+INSERT INTO "sim_holds" VALUES('run','KUCOIN','kucoin','kucoin/HBAR','25000000000');
+CREATE TABLE sim_lost_handoffs (id TEXT PRIMARY KEY);
+CREATE TABLE sim_runs (
+    id TEXT PRIMARY KEY, worker TEXT NOT NULL REFERENCES sim_workers, network TEXT NOT NULL,
+    request TEXT NOT NULL, gas_evidence TEXT, moves TEXT NOT NULL, script TEXT NOT NULL, state TEXT NOT NULL,
+    reason TEXT, guard_resolved INTEGER NOT NULL DEFAULT 0
+);
+"""
+    'INSERT INTO "sim_runs" '
+    "VALUES('run','hedera-saucerswap-v1-whbar-usdc__kucoin-hbar-usdt','hedera-mainnet','{\"buy\": "
+    '{"base": {"scale": 8, "units": 25000000000}, "epoch": "mock-1", "expires_ms": 1795474162000, '
+    '"market": {"base_id": "0x0000000000000000000000000000000000163b5a", "base_scale": 8, "network": '
+    '"hedera-mainnet", "pool": "0xdb34c1ef944883f0e5a2fc18b6c1978b088bd31d", "settlement_id": '
+    '"0x000000000000000000000000000000000006f89a", "settlement_scale": 6, "source_id": '
+    '"mock/hedera/295/saucerswap-v1/0xdb34c1ef944883f0e5a2fc18b6c1978b088bd31d", "symbol": null, '
+    '"venue": "saucerswap-v1"}, "mode": "SIMULATION", "observed_ms": 1795474157000, "request_id": '
+    '"run-dex", "settlement": {"scale": 6, "units": 12000003}, "side": "BUY"}, "direction": '
+    '"BUY_DEX_SELL_KUCOIN", "evaluated_ms": 1795474157000, "execution_id": "run", "expires_ms": '
+    '1795474162000, "fee_policy_id": "fees", "mapping_revision": "m1", "mode": "SIMULATION", '
+    '"net_profit": {"scale": 6, "units": 150000}, "relationship_id": '
+    '"hedera-saucerswap-v1-whbar-usdc__kucoin-hbar-usdt", "sell": {"base": {"scale": 8, "units": '
+    '25000000000}, "epoch": "mock-1", "expires_ms": 1795474162000, "market": {"base_id": '
+    '"kucoin/HBAR", "base_scale": 8, "network": null, "pool": null, "settlement_id": "kucoin/USDT", '
+    '"settlement_scale": 6, "source_id": "mock/kucoin/spot/HBAR-USDT", "symbol": "HBAR-USDT", '
+    '"venue": "kucoin-spot"}, "mode": "SIMULATION", "observed_ms": 1795474157000, "request_id": '
+    '"run-spot", "settlement": {"scale": 6, "units": 12150003}, "side": "SELL"}, "status": '
+    '"ACCEPTED", "threshold": {"scale": 6, "units": 150000}}\',\'{"costId": "gas", "treatment": '
+    '"SEPARATE", "settlementCostUnits": "3", "assetId": "hedera/295/HBAR", "scale": 8, "units": "5", '
+    '"rateNumerator": "1", "rateDenominator": "2", "rateRef": "mock/rate/1795474157000"}\',\'{"DEX": '
+    '[["dex/hedera-mainnet", "0x0000000000000000000000000000000000163b5a", 25000000000], '
+    '["dex/hedera-mainnet", "0x000000000000000000000000000000000006f89a", -12000000], '
+    '["dex/hedera-mainnet", "hedera/295/HBAR", -5]], "KUCOIN": [["kucoin", "kucoin/HBAR", '
+    '-25000000000], ["kucoin", "kucoin/USDT", 12150003]]}\',\'{"dex": [], "kucoin": []}\',\'DEX\',NULL,0);'
+    """
+CREATE TABLE sim_workers (
+    worker TEXT PRIMARY KEY, incomplete INTEGER NOT NULL DEFAULT 0,
+    paused INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO "sim_workers" VALUES('hedera-saucerswap-v1-whbar-usdc__kucoin-hbar-usdt',0,0,0);
+CREATE UNIQUE INDEX pending_network
+                    ON opportunity_requests(network) WHERE pending = 1
+                ;
+CREATE UNIQUE INDEX pending_relationship_id
+                    ON opportunity_requests(relationship_id) WHERE pending = 1
+                ;
+CREATE UNIQUE INDEX sim_network ON sim_runs(network) WHERE state IN ('DEX','KUCOIN');
+CREATE UNIQUE INDEX sim_worker ON sim_runs(worker) WHERE state IN ('DEX','KUCOIN');
+CREATE INDEX sim_hold_asset ON sim_holds(account,asset);
+COMMIT;"""
+)
+LEGACY_DEX_CONFIRMED = """
+UPDATE sim_balances SET units='125000000000' WHERE asset='0x0000000000000000000000000000000000163b5a';
+UPDATE sim_balances SET units='488000000' WHERE asset='0x000000000000000000000000000000000006f89a';
+UPDATE sim_balances SET units='999999995' WHERE asset='hedera/295/HBAR';
+DELETE FROM sim_holds WHERE leg='DEX';
+UPDATE sim_runs SET state='KUCOIN' WHERE id='run';
+INSERT INTO "sim_attempts" VALUES('run','DEX',1,'SUCCESS','SUCCESS',0,'[["dex/hedera-mainnet", "0x0000000000000000000000000000000000163b5a", 25000000000], ["dex/hedera-mainnet", "0x000000000000000000000000000000000006f89a", -12000000], ["dex/hedera-mainnet", "hedera/295/HBAR", -5]]');
+"""
+
+
+def ledger_snapshot(db):
+    return tuple(
+        db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+        for table in ("sim_balances", "sim_holds", "sim_attempts", "sim_runs")
+    )
+
+
+@pytest.mark.parametrize("dex_confirmed", [False, True])
+def test_original_s3_journal_remains_protected(worker, tmp_path, dex_confirmed):
+    path = tmp_path / "original.sqlite"
+    with closing(sqlite3.connect(path)) as db:
+        db.executescript(LEGACY_RESERVED)
+        if dex_confirmed:
+            db.executescript(LEGACY_DEX_CONFIRMED)
+        before = ledger_snapshot(db)
+        assert len(before[1]) == (1 if dex_confirmed else 3)
+        assert len(before[2]) == int(dex_confirmed)
+        assert db.execute("SELECT count(*) FROM opportunity_requests").fetchone() == (0,)
+    with closing(ExecutionGuard(path)) as guard, patch.object(guard, "resolve") as resolve:
+        for _ in range(2):
+            with closing(
+                SimulationEngine(path, [worker], guard=guard, clock=MockClock())
+            ) as engine:
+                (result,) = engine.recover()
+                assert result.status == "AWAITING_RECONCILIATION" and "provenance" in result.reason
+                assert [(a.leg, a.status) for a in result.attempts] == (
+                    [("DEX", "SUCCESS")] if dex_confirmed else []
+                )
+                assert engine.advance("run") == result
+                assert engine.result("run") == result
+        resolve.assert_not_called()
+        assert guard.pending() == ()
+    with closing(sqlite3.connect(path)) as db:
+        assert ledger_snapshot(db) == before
+        assert db.execute(
+            "SELECT reason FROM sim_admission_diagnostics WHERE id='run'"
+        ).fetchone() == (result.reason,)
+        assert db.execute("SELECT count(*) FROM opportunity_requests").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM sim_run_admissions").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("damage", ["missing", "invalid"])
+def test_every_driver_defers_run_without_positive_provenance(
+    worker, factory, handoff, guard, tmp_path, damage
+):
+    req = handoff(worker)
+    engine = factory(worker)
+    assert (
+        engine.execute(req, plan=FailurePlan(kucoin=("UNKNOWN",))).status
+        == "AWAITING_RECONCILIATION"
+    )
+    with closing(sqlite3.connect(tmp_path / "execution.sqlite")) as db, db:
+        if damage == "missing":
+            db.execute("DELETE FROM sim_run_admissions")
+        else:
+            db.execute("UPDATE sim_run_admissions SET digest='invalid'")
+        before = ledger_snapshot(db)
+    deferred = engine.advance(req.execution_id)
+    assert deferred.status == "AWAITING_RECONCILIATION" and "provenance" in deferred.reason
+    assert (
+        engine.execute(req)
+        == engine.reconcile(req.execution_id, "KUCOIN", 1, "SUCCESS")
+        == deferred
+    )
+    assert engine.recover() == (deferred,)
+    assert guard.pending() == (req.execution_id,)
+    with closing(sqlite3.connect(tmp_path / "execution.sqlite")) as db:
+        assert ledger_snapshot(db) == before
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("conflict", ["units", "scale"])
+def test_separate_engine_openings_conflict(worker, factory, reverse, conflict):
+    other = independent(worker, 2)
+    other = (
+        replace(other, opening=(*other.opening[:4], 0))
+        if conflict == "units"
+        else replace(other, kucoin=replace(other.kucoin, settlement_scale=5))
+    )
+    first, second = (other, worker) if reverse else (worker, other)
+    engine = factory(first)
+    with pytest.raises(ValueError, match="conflicting opening"):
+        factory(second)
+    assert engine.balance("kucoin", "kucoin/USDT") == Balance(first.opening[4], 0)
+    with engine.journal.transaction(write=False) as db:
+        assert not db.execute(
+            "SELECT 1 FROM sim_workers WHERE worker=?", (second.relationship_id,)
+        ).fetchone()
+
+
+@pytest.mark.parametrize("matching", [False, True])
+def test_concurrent_constructors_share_one_opening(worker, factory, matching):
+    other = independent(worker, 2)
+    if not matching:
+        other = replace(other, opening=(*other.opening[:4], 0))
+    start = Barrier(2)
+
+    def launch(config):
+        start.wait()
+        try:
+            return factory(config)
+        except ValueError as exc:
+            assert "conflicting opening" in str(exc)
+            return None
+
+    with ThreadPoolExecutor(2) as pool:
+        engines = list(pool.map(launch, (worker, other)))
+    assert sum(e is not None for e in engines) == (2 if matching else 1)
+    for config, engine in zip((worker, other), engines):
+        if engine is not None:
+            assert engine.balance("kucoin", "kucoin/USDT") == Balance(config.opening[4], 0)
+            with engine.journal.transaction(write=False) as db:
+                assert (
+                    db.execute(
+                        "SELECT count(*) FROM sim_openings WHERE account='kucoin'"
+                    ).fetchone()[0]
+                    == 2
+                )
+
+
+def test_new_instance_compares_opening_after_confirmed_trade(worker, factory, handoff):
+    e = factory(worker)
+    req = handoff(worker)
+    completed = e.execute(req)
+    filled = balances(e, worker)
+    e.close()
+    other = independent(worker, 2)
+    restarted = factory(other)
+    assert balances(restarted, other)[3:] == filled[3:]
+    assert restarted.result(req.execution_id) == completed
+    # Even a declaration equal to the new current balance must conflict.
+    with pytest.raises(ValueError, match="conflicting opening"):
+        factory(replace(other, opening=(*other.opening[:4], filled[4].recorded)))
+
+
+def test_old_inventory_without_independent_opening_is_readable_but_unspendable(
+    worker, tmp_path, guard, handoff
+):
+    path = tmp_path / "old-inventory.sqlite"
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute(
+            "CREATE TABLE sim_balances (account TEXT, asset TEXT, scale INTEGER, units TEXT, PRIMARY KEY(account,asset))"
+        )
+        db.execute("INSERT INTO sim_balances VALUES ('kucoin','kucoin/USDT',6,'481234567')")
+    req = handoff(worker, SELL_DEX)
+    with closing(SimulationEngine(path, [worker], guard=guard, clock=MockClock())) as engine:
+        balance = engine.balance("kucoin", "kucoin/USDT")
+        assert (balance.recorded, balance.reserved, balance.available, balance.opening_known) == (
+            481234567,
+            0,
+            0,
+            False,
+        )
+        assert engine.worker_state(worker.relationship_id).status == "AWAITING_RECONCILIATION"
+        result = engine.execute(req)
+        assert result.status == "AWAITING_RECONCILIATION" and "opening declaration" in result.reason
+        assert_unjournaled(engine, req.execution_id)
+        assert engine.recover() == (result,) and guard.pending() == (req.execution_id,)
+    with closing(sqlite3.connect(path)) as db:
+        assert not db.execute(
+            "SELECT 1 FROM sim_openings WHERE account='kucoin' AND asset='kucoin/USDT'"
+        ).fetchone()
+        assert db.execute(
+            "SELECT units FROM sim_balances WHERE account='kucoin' AND asset='kucoin/USDT'"
+        ).fetchone() == ("481234567",)
+
+
+def test_admission_proof_failure_rolls_back_run_and_all_holds(worker, factory, handoff, guard):
+    engine = factory(worker)
+    req = handoff(worker)
+    with engine.journal.transaction() as db:
+        db.execute("""CREATE TRIGGER fail_proof BEFORE INSERT ON sim_run_admissions
+                      BEGIN SELECT RAISE(ABORT, 'proof write failed'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="proof write failed"):
+        engine.submit(req)
+    assert guard.pending() == (req.execution_id,)
+    assert_unjournaled(engine, req.execution_id)
+    assert balances(engine, worker) == tuple(Balance(n, 0) for n in worker.opening)
+    with engine.journal.transaction() as db:
+        db.execute("DROP TRIGGER fail_proof")
+    assert engine.recover()[0].status == "COMPLETED"

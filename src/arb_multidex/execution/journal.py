@@ -1,5 +1,6 @@
 """SQLite journal and integer-atom inventory. Each transition is one transaction."""
 
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ CREATE TABLE IF NOT EXISTS sim_runs (
     request TEXT NOT NULL, gas_evidence TEXT, moves TEXT NOT NULL, script TEXT NOT NULL, state TEXT NOT NULL,
     reason TEXT, guard_resolved INTEGER NOT NULL DEFAULT 0
 );
+-- Created only by the verified first-submission transaction. No legacy backfill.
+CREATE TABLE IF NOT EXISTS sim_run_admissions (
+    id TEXT PRIMARY KEY REFERENCES sim_runs, digest TEXT NOT NULL
+);
 CREATE UNIQUE INDEX IF NOT EXISTS sim_network ON sim_runs(network) WHERE state IN ('DEX','KUCOIN');
 CREATE UNIQUE INDEX IF NOT EXISTS sim_worker ON sim_runs(worker) WHERE state IN ('DEX','KUCOIN');
 CREATE TABLE IF NOT EXISTS sim_attempts (
@@ -29,6 +34,14 @@ CREATE TABLE IF NOT EXISTS sim_balances (
     account TEXT NOT NULL, asset TEXT NOT NULL, scale INTEGER NOT NULL, units TEXT NOT NULL,
     PRIMARY KEY(account,asset)
 );
+CREATE TABLE IF NOT EXISTS sim_openings (
+    account TEXT NOT NULL, asset TEXT NOT NULL, scale INTEGER NOT NULL, units TEXT NOT NULL,
+    PRIMARY KEY(account,asset), FOREIGN KEY(account,asset) REFERENCES sim_balances
+);
+CREATE TRIGGER IF NOT EXISTS sim_openings_no_update BEFORE UPDATE ON sim_openings
+BEGIN SELECT RAISE(ABORT, 'immutable simulated opening declaration'); END;
+CREATE TRIGGER IF NOT EXISTS sim_openings_no_delete BEFORE DELETE ON sim_openings
+BEGIN SELECT RAISE(ABORT, 'immutable simulated opening declaration'); END;
 CREATE TABLE IF NOT EXISTS sim_holds (
     id TEXT NOT NULL REFERENCES sim_runs, leg TEXT NOT NULL, account TEXT NOT NULL,
     asset TEXT NOT NULL, units TEXT NOT NULL, PRIMARY KEY(id,leg,account,asset),
@@ -42,10 +55,11 @@ CREATE INDEX IF NOT EXISTS sim_hold_asset ON sim_holds(account,asset);
 class Balance:
     recorded: int
     reserved: int
+    opening_known: bool = True
 
     @property
     def available(self):
-        return self.recorded - self.reserved
+        return self.recorded - self.reserved if self.opening_known else 0
 
 
 class Journal:
@@ -74,11 +88,17 @@ class Journal:
 
 def balance(db, account, asset):
     key = account, asset
-    row = db.execute("SELECT units FROM sim_balances WHERE account=? AND asset=?", key).fetchone()
+    row = db.execute(
+        "SELECT b.units, o.account IS NOT NULL AS opening_known FROM sim_balances b "
+        "LEFT JOIN sim_openings o USING(account,asset,scale) WHERE b.account=? AND b.asset=?",
+        key,
+    ).fetchone()
     if row is None:
         raise KeyError(key)
     holds = db.execute("SELECT units FROM sim_holds WHERE account=? AND asset=?", key)
-    return Balance(int(row["units"]), sum(int(r["units"]) for r in holds))
+    return Balance(
+        int(row["units"]), sum(int(r["units"]) for r in holds), bool(row["opening_known"])
+    )
 
 
 def seed(db, workers):
@@ -94,15 +114,46 @@ def seed(db, workers):
         [(worker.relationship_id,) for worker in workers],
     )
     for (account, asset), (scale, units) in openings.items():
-        db.execute(
-            "INSERT OR IGNORE INTO sim_balances VALUES (?,?,?,?)",
-            (account, asset, scale, str(units)),
-        )
-        stored = db.execute(
-            "SELECT scale FROM sim_balances WHERE account=? AND asset=?", (account, asset)
+        key = account, asset
+        opening = db.execute(
+            "SELECT scale,units FROM sim_openings WHERE account=? AND asset=?", key
         ).fetchone()
-        if stored["scale"] != scale:
-            raise ValueError("conflicting scale for a shared simulated asset")
+        current = db.execute(
+            "SELECT scale FROM sim_balances WHERE account=? AND asset=?", key
+        ).fetchone()
+        if opening is not None and (opening["scale"], opening["units"]) != (scale, str(units)):
+            raise ValueError("conflicting opening declarations for a shared simulated asset")
+        if current is None:
+            if opening is not None:
+                raise ValueError("missing current balance; reconciliation required")
+            values = account, asset, scale, str(units)
+            db.execute("INSERT INTO sim_balances VALUES (?,?,?,?)", values)
+            db.execute("INSERT INTO sim_openings VALUES (?,?,?,?)", values)
+        elif current["scale"] != scale:
+            raise ValueError(
+                "conflicting scale for a shared simulated asset; reconciliation required"
+            )
+        # Existing inventory without an independent opening record stays readable
+        # for recovery. Neither today's config nor the mutable balance proves its origin.
+
+
+def opening_problem(db, assets):
+    for account, asset in assets:
+        if (
+            db.execute(
+                "SELECT 1 FROM sim_openings JOIN sim_balances USING(account,asset,scale) "
+                "WHERE account=? AND asset=?",
+                (account, asset),
+            ).fetchone()
+            is None
+        ):
+            return f"opening declaration unproven for {account} {asset}; reconciliation required"
+    return None
+
+
+def admission_digest(request, moves):
+    # Bind the verified request to the exact movements approved in the same commit.
+    return hashlib.sha256((request + "\0" + moves).encode()).hexdigest()
 
 
 def reserve(db, execution_id, moves):
