@@ -211,6 +211,25 @@ class DecisionContext:
 
 
 @dataclass(frozen=True)
+class AcceptedCost:
+    """One component of the quote, expressed in the leg's settlement atoms."""
+
+    cost_id: str
+    treatment: str
+    settlement_units: int
+
+
+@dataclass(frozen=True)
+class SeparateCost(AcceptedCost):
+    asset_id: str
+    native: Amount
+    numerator: int
+    denominator: int
+    rate_ref: str | None
+    rate: Rate | None  # Exact trusted observation for a foreign-asset conversion.
+
+
+@dataclass(frozen=True)
 class Leg:
     mode: str
     market: Market
@@ -220,7 +239,10 @@ class Leg:
     settlement: Amount
     epoch: str
     observed_ms: int
-    expires_ms: int
+    expires_ms: int  # Earliest of quote and required rate expiries.
+    quote_expires_ms: int
+    gross_settlement: Amount
+    costs: tuple[AcceptedCost, ...]
 
 
 @dataclass(frozen=True)

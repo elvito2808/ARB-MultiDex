@@ -311,3 +311,74 @@
 تنها ورودی موجود در کش به `SIMULATION` تعلق دارد و مصرف‌کننده تصمیم `LIVE` می‌خواهد. جست‌وجو با کلید `LIVE` نتیجه‌ای ندارد. دادهٔ `SIMULATION` برای این تصمیم واجد شرایط نیست و فرصتی تولید نمی‌شود.
 
 S1 برای بازنگری ۲ تأیید ۳۷ از ۳۷ گزاره را با داده‌های JSON سند، ساعت ثابت و حساب صحیح گزارش کرد. بازتولید دقیق آن اجرا به برنامهٔ آزمون اصلی و فهرست گزاره‌های آن نیاز دارد. شواهد این سند به طراحی و نمونه‌ها محدودند. اعتبارسنجی اتصال واقعی، مدل قیمت‌گذاری تولید، ساعت همگام، هم‌زمانی و جداسازی عملیاتی پس از پیاده‌سازی موضوع آزمون مستقل‌اند.
+
+## S2 → S3 simulation admission, version 1
+
+S2 validates each leg under the pinned decision context. The admitted
+`ExecutionRequest` binds the execution ID, relationship, direction, mapping
+revision, fee policy, both market identities and request IDs, base volumes,
+profit, threshold, decision time, expiry, mode and status.
+
+The evidence types are defined in `arb_multidex.opportunity.models`.
+On each leg, `gross_settlement` includes embedded fees and `settlement` is the
+final payment or receipt. `costs` is an immutable tuple in accepted quote order.
+Each component records its ID, treatment and settlement atoms. A `SeparateCost`
+also carries `asset_id`, `native` (integer units and scale), and the exact
+`numerator` and `denominator` used for conversion. For a foreign asset,
+`rate_ref` identifies the frozen `rate` observation that S2 checked, including
+its trusted source, both assets and scales, fraction, observation and exclusive
+expiry. A settlement-asset conversion has a unit ratio and both references are
+`None`. The quote source, epoch, observation and age deadline are available as
+`market.source_id`, `epoch`, `observed_ms` and `quote_expires_ms`. The effective
+leg expiry also accounts for rate expiry. All timestamps are UTC epoch milliseconds.
+
+### Journal migration and evidence classification
+
+The detector commits the unique claim, a SHA-256 digest of the canonical
+version 1 payload bytes in the database text encoding, and the payload itself in the same SQLite transaction.
+The digest lives on the claim, so deleting or replacing its payload is
+detectable. Keep the journal under trusted application control.
+
+On first open, a single SQLite write transaction inspects the existing schema,
+adds the claim marker and classifies existing rows before admitting new writes.
+
+| Journal at upgrade | Classification |
+| --- | --- |
+| Original ID-only schema | Existing claims receive an explicit legacy marker. Their accepted financial evidence cannot be recovered. |
+| Revision 1 schema with a stored text payload | The claim receives a digest of the existing bytes. Every recovery or verification still validates the complete payload. |
+| Revision 1 schema with absent or unreadable evidence | Provenance is unknown. The claim stays unavailable for execution and requires reconciliation. |
+
+Subsequent opens preserve the markers. Migration relies on an intact schema
+and the contents available at upgrade. A digest created during migration
+cannot independently establish the prior history of a Revision 1 payload.
+
+### S3 recovery and first reservation
+
+Import `LegacyAdmission` and `AdmissionEvidenceError` from
+`arb_multidex.opportunity.guard`. Both lookups are read-only.
+
+| Claim state | `read_pending(execution_id)` | `verify_pending(request)` |
+| --- | --- | --- |
+| Valid evidence, pending | Immutable typed request | Journal request on an exact match, otherwise `None` |
+| Proven legacy, pending | `LegacyAdmission(execution_id)` | `None` |
+| Absent or resolved | `None` | `None` |
+| Missing, ambiguous, malformed, unsupported, inconsistent or unreadable evidence | Raises `AdmissionEvidenceError` | Raises `AdmissionEvidenceError` for the identified request, including a mismatched submission |
+
+For a first reservation, S3 uses the request returned by `verify_pending`.
+Recovery by ID uses `read_pending`. Reads check the digest, schema and types,
+claim and market identities, both legs, exact-cost arithmetic, profit threshold,
+and validity at the recorded decision time. S3 checks current freshness at use.
+Only the explicit legacy result identifies a legacy lost handoff. On an
+evidence error, record the diagnostic with its execution ID, keep the claim
+pending for reconciliation, and create no reservation or attempt. A mismatch
+leaves the genuine claim available for verification.
+
+- For a DEX BUY use `accepted.buy`, and for a DEX SELL use `accepted.sell`.
+  Book gross settlement and charge each separate native cost once. Embedded
+  fees are already reflected in gross settlement. The journal supplies all
+  evidence needed from the accepted quote.
+- Verification is repeatable while pending. S3 serializes first reservation
+  and resolution under its execution-ID idempotency rules, checks freshness
+  at reservation, and resolves after reconciliation. For an already journaled
+  run, S3 compares the exact request to its own durable record before returning
+  its previous result. Resolution permanently spends the S2 claim.
