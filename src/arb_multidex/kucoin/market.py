@@ -85,6 +85,7 @@ class KuCoin(Feed):
         socket=open_socket,
         timeout=5,
         retry_seconds=10,
+        stream_max_age_ms=None,
         monotonic=time.monotonic,
         **clock_options,
     ):
@@ -105,6 +106,11 @@ class KuCoin(Feed):
             settlement_scale,
             **clock_options,
         )
+        if stream_max_age_ms is not None and (
+            type(stream_max_age_ms) is not int or stream_max_age_ms <= 0
+        ):
+            raise ValueError("invalid WebSocket freshness limit")
+        self.stream_max_age_ms = stream_max_age_ms
         self.symbol = symbol
         self.topic = f"/spotMarket/level2Depth5:{symbol}"
         self.http, self.socket = http, socket
@@ -219,7 +225,15 @@ class KuCoin(Feed):
         with self.lock:
             if self.monotonic() >= self.retry_at:
                 try:
-                    return self._stream()
+                    book = self._stream()
+                    if self.stream_max_age_ms is not None:
+                        with self.state_lock:
+                            now = self.now()
+                            self.validate_observation(book, now)
+                            if now - book.observed_ms >= self.stream_max_age_ms:
+                                raise MarketError("STALE_QUOTE", "expired WebSocket observation")
+                    self.last_error = None
+                    return book
                 except STREAM_ERRORS as exc:
                     self.last_error = type(exc).__name__
                     if self.ws is not None:

@@ -88,7 +88,7 @@ class QuoteProducer:
             "settlementScale": feed.settlement_scale,
         }
 
-    def quote(self, raw):
+    def quote(self, raw, *, observation=None, on_gas=None):
         """Accept a UTF-8 JSON message or its decoded dict. Return one SIM-01 envelope."""
         rid = source = None
         try:
@@ -104,18 +104,26 @@ class QuoteProducer:
             ):
                 raise invalid("request differs from market binding")
             with self.feed.lock:
-                return self._produce(req)
+                return self._produce(req, observation, on_gas)
         except MarketError as exc:
             code = exc.code
         except (ValueError, TypeError, RecursionError, OverflowError):
             code = "INVALID_QUOTE"
         return {"status": "ERROR", "requestId": rid, "sourceId": source, "code": code}
 
-    def _produce(self, req):
+    def capture(self):
+        """Capture once for a group of requests sharing this feed's lock."""
+        with self.feed.lock:
+            snap = self.feed.read()
+            with self.feed.state_lock:
+                return snap, self.feed.epoch
+
+    def _produce(self, req, observation, on_gas):
         feed, cfg = self.feed, self.config
-        snap = feed.read()
+        snap, generation = observation if observation is not None else self.capture()
         with feed.state_lock:
-            generation = feed.epoch
+            if generation != feed.epoch:
+                raise invalid("connection changed before pricing")
             feed.validate_observation(snap, feed.now())
         observed = UNIX_EPOCH + timedelta(milliseconds=snap.observed_ms)
         side, q = req["side"], cfg.base_units
@@ -127,7 +135,10 @@ class QuoteProducer:
         except (OSError, TransportError, MarketError, ValueError, TypeError, KeyError):
             evidence = None
         with feed.state_lock:
-            return self._publish(req, snap, observed, generation, gross, embedded, evidence)
+            result = self._publish(req, snap, observed, generation, gross, embedded, evidence)
+            if on_gas is not None:
+                on_gas(evidence)
+            return result
 
     def _publish(self, req, snap, observed, generation, gross, embedded, evidence):
         feed = self.feed

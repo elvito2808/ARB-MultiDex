@@ -1,28 +1,55 @@
-# Each entry is an independent SIM-01 producer binding. S4 may pass a parsed
-# entry to arb_multidex.quotes.config.build_market. Share the feed across
-# relationship bindings to retain a single market epoch and accepted watermark.
-dex:
-  venue: saucerswap-v1
-  provider: mock
-  mode: SIMULATION
-  relationship_id: fixture-dex
-  mapping_revision: fixture-1
-  fee_policy_id: fixture-pool-and-gas
-  base_units: 100000000   # one WHBAR in both directions
-  max_age_ms: 5000       # example policy
-  rpc_endpoints: []      # required for public reads, in failover order
-  gas_rate_source: null  # public quotes also need a trusted, time-bound estimate
-kucoin:
-  venue: kucoin-spot
-  provider: mock
-  mode: SIMULATION
-  relationship_id: fixture-spot
-  mapping_revision: fixture-1
-  fee_policy_id: fixture-spot-fee
-  mock_symbol: TEST-USDT
-  symbol: null           # set the public market and its scales explicitly
-  base_scale: 8
-  settlement_scale: 6
-  base_units: 100000000
-  max_age_ms: 5000
-  settlement_fee_bps: 10 # explicit mock settlement-asset fee policy
+# S4 passes the parsed real_markets section to RealMarkets in both execution modes.
+# These are venue and mapping examples for explicit owner review.
+real_markets:
+  relationship_id: hedera-kucoin-hbar
+  mapping_revision: whbar-hbar-usdc-usdt-v1
+  fee_policy_id: configured-venue-fees-and-gas-v1
+  base_units: 25000000000 # 250 HBAR/WHBAR at scale 8
+  minimum_net_profit_units: 0 # settlement scale 6
+  equivalent_bases: true # explicit WHBAR/HBAR 1:1 policy
+  one_to_one_settlements: false # owner must authorize USDC/USDT 1:1 for S2 comparison
+  max_skew_ms: 3000
+  dex:
+    rpc_endpoints: [https://mainnet.hashio.io/api]
+    pool: "0xdB34c1Ef944883f0e5A2fC18B6C1978B088bD31d"
+    max_age_ms: 5000
+    pool_fee_bps: 30 # configured SaucerSwap V1 pricing assumption
+    # Supply verified buy_tinybars, sell_tinybars and reference for the intended route.
+    gas_bound: null
+    # Supply a trusted source ID and an authenticated/time-bound rate_lookup in S4.
+    gas_rate_source: null
+  kucoin:
+    symbol: HBAR-USDT
+    base_scale: 8
+    settlement_scale: 6
+    max_age_ms: 5000
+    # Set an explicit settlement-asset fee assumption for the intended account/route.
+    settlement_fee_bps: null
+
+# These entries are only for explicit offline fixtures via quotes.config.build_market.
+offline_fixtures:
+  dex:
+    venue: saucerswap-v1
+    provider: mock
+    mode: SIMULATION
+    relationship_id: fixture-dex
+    mapping_revision: fixture-1
+    fee_policy_id: fixture-pool-and-gas
+    base_units: 100000000   # one WHBAR in both directions
+    max_age_ms: 5000       # example policy
+    rpc_endpoints: []      # required for public reads, in failover order
+    gas_rate_source: null  # public quotes also need a trusted, time-bound estimate
+  kucoin:
+    venue: kucoin-spot
+    provider: mock
+    mode: SIMULATION
+    relationship_id: fixture-spot
+    mapping_revision: fixture-1
+    fee_policy_id: fixture-spot-fee
+    mock_symbol: TEST-USDT
+    symbol: null           # set the public market and its scales explicitly
+    base_scale: 8
+    settlement_scale: 6
+    base_units: 100000000
+    max_age_ms: 5000
+    settlement_fee_bps: 10 # explicit mock settlement-asset fee policy

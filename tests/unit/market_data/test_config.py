@@ -10,7 +10,7 @@ from arb_multidex.quotes.config import build_market
 
 def example():
     path = Path(__file__).resolve().parents[3] / "config" / "markets.example.yaml"
-    return yaml.safe_load(path.read_text())
+    return yaml.safe_load(path.read_text())["offline_fixtures"]
 
 
 def test_reproducible_example_without_network(monkeypatch):
