@@ -9,7 +9,7 @@ Use inspect("dex") or inspect("kucoin") to query either venue independently.
 
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from fractions import Fraction
 from types import MappingProxyType
@@ -30,10 +30,18 @@ from arb_multidex.opportunity import (
     Terms,
 )
 from arb_multidex.quotes import QuoteConfig, QuoteProducer
-from arb_multidex.quotes.fees import MAX_UNITS, GasEstimate, GasPolicy, SpotFeePolicy, identifier
+from arb_multidex.quotes.fees import (
+    MAX_UNITS,
+    GasEstimate,
+    GasPolicy,
+    SpotFeePolicy,
+    fee_error,
+    identifier,
+)
 from arb_multidex.quotes.producer import UNIX_EPOCH
 
 from .feed import MarketError, utc_ms
+from .http import TransportError
 from .rpc import ManagedRPC
 
 GAS_ASSET = "hedera/295/HBAR"
@@ -44,7 +52,30 @@ class MarketBatch:
     calls: Mapping[tuple[Direction, str], Call]
     observations: Mapping[str, dict]
     rates: Mapping[str, Rate]
+    fee_deadlines: Mapping[str, int]
     provenance = "REAL"
+
+
+@dataclass(frozen=True)
+class VenueFee:
+    """Result of an independently verified lookup for one fee-policy scope."""
+
+    source: str
+    reference: str
+    market: str
+    fee_policy_id: str
+    side: str
+    settlement_asset: str
+    basis_points: int
+    observed_ms: int
+    valid_until_ms: int
+
+    def current(self, now):
+        return (
+            type(self.observed_ms) is int
+            and type(self.valid_until_ms) is int
+            and 0 <= self.observed_ms <= now < self.valid_until_ms
+        )
 
 
 @dataclass(frozen=True)
@@ -85,11 +116,20 @@ class RealMarkets:
     rate_lookup(feed, snapshot, side, base_atoms) returns (rate_ref, S2 Rate).
     The configured trusted source must supply a time-bound HBAR-to-USDC rate
     in settlement atoms per tinybar. Supply a conservative bound verified for
-    the intended swap route and volume. Missing evidence prevents publication.
+    the intended swap route and volume.
+
+    fee_lookup(request) is a trusted, read-only verifier injected by the caller.
+    It must independently resolve a traceable record from the configured
+    fee_evidence_source for that venue, or return None. It must authenticate the
+    record and establish applicability to the account/route represented by the
+    feePolicyId, including fee treatment and denomination. VenueFee carries the
+    verified result, which this provider binds to the request and checks for
+    expiry. Use an opaque, non-secret reference. Configured bps are diagnostics.
     """
 
     def __init__(
-        self, config, *, clock=utc_ms, rate_lookup=None, rpc_options=None, kucoin_options=None
+        self, config, *, clock=utc_ms, rate_lookup=None, fee_lookup=None,
+        rpc_options=None, kucoin_options=None,
     ):
         dex, spot = config["dex"], config["kucoin"]
         if spot["symbol"] != "HBAR-USDT" or spot["base_scale"] != 8:
@@ -99,7 +139,7 @@ class RealMarkets:
         self.clock = clock
         self.dex = SaucerSwap(
             ManagedRPC(dex["rpc_endpoints"], **(rpc_options or {})),
-            pool=dex["pool"], fee_bps=dex["pool_fee_bps"], clock=clock,
+            pool=dex["pool"], fee_bps=None, clock=clock,
         )
         self.kucoin = KuCoin(
             spot["symbol"], spot["base_scale"], spot["settlement_scale"], clock=clock,
@@ -113,12 +153,21 @@ class RealMarkets:
         ):
             raise ValueError("invalid gas rate source")
         self.rate_lookup = rate_lookup
-        spot_bps = spot["settlement_fee_bps"]
-        if spot_bps is not None and (type(spot_bps) is not int or not 0 <= spot_bps < 10000):
-            raise ValueError("invalid spot fee")
+        self.fee_lookup = fee_lookup
+        self.fee_estimates = {"dex": dex["pool_fee_bps"], "kucoin": spot["settlement_fee_bps"]}
+        self.fee_sources = {
+            venue: settings.get("fee_evidence_source")
+            for venue, settings in (("dex", dex), ("kucoin", spot))
+        }
+        for venue, bps in self.fee_estimates.items():
+            if bps is not None and (type(bps) is not int or not 0 <= bps < 10000):
+                raise ValueError(f"invalid {venue} fee estimate")
+            source = self.fee_sources[venue]
+            if source is not None and (not identifier(source) or source.startswith("mock/")):
+                raise ValueError(f"invalid {venue} fee evidence source")
         self.policies = {
             "dex": GasPolicy(self.rate_source, self._gas),
-            "kucoin": SpotFeePolicy(spot_bps),
+            "kucoin": SpotFeePolicy(None),
         }
         d, k = self.dex, self.kucoin
         dex_market = Market(
@@ -172,6 +221,50 @@ class RealMarkets:
             rate.observed_ms, rate.expires_ms,
         )
 
+    def _venue_fee(self, venue, req, feed):
+        source = self.fee_sources[venue]
+        if source is None or self.fee_lookup is None:
+            return None
+        try:
+            fee = self.fee_lookup(MappingProxyType(req))
+            now = feed.now()
+        except (OSError, TransportError, MarketError, ValueError, TypeError, KeyError):
+            return None
+        if (
+            isinstance(fee, VenueFee)
+            and fee.source == source
+            and identifier(fee.reference)
+            and not fee.reference.startswith("mock/")
+            and (fee.market, fee.fee_policy_id, fee.side, fee.settlement_asset)
+            == (req["sourceId"], req["feePolicyId"], req["side"], req["settlementAssetId"])
+            and type(fee.basis_points) is int
+            and 0 <= fee.basis_points < 10000
+            and fee.current(now)
+        ):
+            return fee
+        return None
+
+    def _quote_with_fee(self, producer, venue, req, observation, remember):
+        fee = self._venue_fee(venue, req, producer.feed)
+        if fee is None:
+            return producer.quote(req, observation=observation, on_gas=remember), None
+
+        def check_venue_fee(now):
+            if not fee.current(now):
+                raise fee_error()
+
+        price = None
+        policy = producer.fees
+        if venue == "dex":
+            def price(snap, side, quantity):
+                return self.dex.price_with_fee(snap, side, quantity, fee.basis_points)
+        else:
+            policy = SpotFeePolicy(fee.basis_points)
+        scoped = QuoteProducer(
+            producer.feed, producer.config, policy, price=price, check_venue_fee=check_venue_fee,
+        )
+        return scoped.quote(req, observation=observation, on_gas=remember), fee
+
     def _requests(self):
         requests = {venue: {} for venue in self.feeds}
         for direction in Direction:
@@ -190,13 +283,13 @@ class RealMarkets:
             "observedAt": None, "availableDepth": None, "sides": {},
         }
         if venue == "dex":
-            diagnostic["fees"] = {"poolBps": self.dex.fee_bps, "basis": "CONFIGURED_ESTIMATE"}
+            diagnostic["fees"] = {"poolBps": self.fee_estimates[venue], "basis": "CONFIGURED_ESTIMATE"}
             diagnostic["pool"] = self.dex.pool
         else:
             diagnostic["fees"] = {
-                "settlementBps": producer.fees.basis_points, "basis": "CONFIGURED_ESTIMATE",
+                "settlementBps": self.fee_estimates[venue], "basis": "CONFIGURED_ESTIMATE",
             }
-        rates, calls = {}, {}
+        rates, calls, fees = {}, {}, {}
         conflicting_refs = set()
 
         def remember(gas):
@@ -224,7 +317,9 @@ class RealMarkets:
                     diagnostic["capturedEpoch"] = epoch
                     self._snapshot_details(venue, diagnostic, snap)
                 for key, req in requests.items():
-                    reply = producer.quote(req, observation=observation, on_gas=remember)
+                    reply, fees[key] = self._quote_with_fee(
+                        producer, venue, req, observation, remember,
+                    )
                     calls[key] = Call(req, reply)
                 for key, call in calls.items():
                     req, reply = call.request, call.response
@@ -233,7 +328,7 @@ class RealMarkets:
                         reply = self._error(req, "FEE_UNAVAILABLE")
                         calls[key] = Call(req, reply)
                     diagnostic["sides"][req["side"]] = self._side_details(
-                        producer, snap, req["side"], reply
+                        producer, snap, req["side"], reply, fees[key]
                     )
             with feed.state_lock:
                 state = _source_state(feed)
@@ -279,12 +374,18 @@ class RealMarkets:
                 availableDepth={"BUY": str(snap.ask_size), "SELL": str(snap.bid_size)},
             )
 
-    def _side_details(self, producer, snap, side, reply):
+    def _side_details(self, producer, snap, side, reply, fee):
         result = {"valid": reply["status"] == "OK"}
         if result["valid"]:
             result.update(
                 costs=reply["includedCosts"], settlementUnits=reply["settlementUnits"],
                 grossSettlementUnits=reply["grossSettlementUnits"],
+                grossPrice=self._gross_price(producer, int(reply["grossSettlementUnits"])),
+                feeEvidence={
+                    "source": fee.source, "reference": fee.reference,
+                    "basisPoints": fee.basis_points, "observedMs": fee.observed_ms,
+                    "validUntilMs": fee.valid_until_ms,
+                },
             )
             for cost in reply["includedCosts"]:
                 if cost["costId"] == "gas":
@@ -293,21 +394,31 @@ class RealMarkets:
                         "tinybars": cost["units"], "rateRef": cost["rateRef"],
                         "rateSource": self.rate_source,
                     }
-        else:
-            result["error"] = reply["code"]
+            return result
+        result["error"] = reply["code"]
         try:
-            gross, embedded = producer.feed.price(snap, side, producer.config.base_units)
+            quantity = producer.config.base_units
+            if producer.feed is self.dex:
+                gross, embedded = self.dex.price_with_fee(
+                    snap, side, quantity, self.fee_estimates["dex"],
+                )
+            else:
+                gross, embedded = producer.feed.price(snap, side, quantity)
         except MarketError as exc:
             result["pricingError"] = str(exc)
         else:
             result.update(
                 grossSettlementUnits=str(gross), embeddedCosts=embedded,
-                grossPrice=str(Fraction(
-                    gross * 10**producer.feed.base_scale,
-                    producer.config.base_units * 10**producer.feed.settlement_scale,
-                )),
+                grossPrice=self._gross_price(producer, gross),
             )
         return result
+
+    @staticmethod
+    def _gross_price(producer, gross):
+        return str(Fraction(
+            gross * 10**producer.feed.base_scale,
+            producer.config.base_units * 10**producer.feed.settlement_scale,
+        ))
 
     def inspect(self, venue):
         """Query one venue, returning diagnostics even when costs prevent a valid quote."""
@@ -320,8 +431,17 @@ class RealMarkets:
             venue_calls, observations[venue], venue_rates = self._collect(venue, requests)
             calls.update(venue_calls)
             rates.update(venue_rates)
+        deadlines = {}
+        for report in observations.values():
+            expiries = [
+                side["feeEvidence"]["validUntilMs"]
+                for side in report["sides"].values() if "feeEvidence" in side
+            ]
+            if expiries:
+                deadlines[report["source"]] = min(expiries)
         return MarketBatch(
-            MappingProxyType(calls), MappingProxyType(observations), MappingProxyType(rates)
+            MappingProxyType(calls), MappingProxyType(observations), MappingProxyType(rates),
+            MappingProxyType(deadlines),
         )
 
     @contextmanager
@@ -332,7 +452,12 @@ class RealMarkets:
             for feed in sorted(self.feeds.values(), key=lambda feed: feed.source_id):
                 stack.enter_context(feed.state_lock)
                 sources[feed.source_id] = _source_state(feed)
-            yield DecisionContext(self.clock(), sources, batch.rates)
+            now = self.clock()
+            for source, deadline in batch.fee_deadlines.items():
+                if now >= deadline:
+                    # S2 readiness is market-wide. An expired side fences the batch's venue.
+                    sources[source] = replace(sources[source], ready=False)
+            yield DecisionContext(now, sources, batch.rates)
 
     def close(self):
         for feed in self.feeds.values():

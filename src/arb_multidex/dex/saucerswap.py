@@ -107,11 +107,16 @@ class SaucerSwap(Feed):
         return Reserves(height, digest, observed, settlement, base, last_update, self.now())
 
     def price(self, snap, side, q):
-        if self.fee_bps is None:
-            if side == "BUY" and q >= snap.base:
-                raise unavailable("insufficient base liquidity")
+        return self.price_with_fee(snap, side, q, self.fee_bps)
+
+    def price_with_fee(self, snap, side, q, fee_bps):
+        if fee_bps is None:
+            if side == "BUY":
+                # Zero fee gives the minimum possible input. Use it only to reject
+                # a BUY that cannot fit even at this lower bound.
+                pool_amount(side, q, snap.base, snap.settlement, fee_bps=0)
             raise fee_error()
-        gross = pool_amount(side, q, snap.base, snap.settlement, fee_bps=self.fee_bps)
+        gross = pool_amount(side, q, snap.base, snap.settlement, fee_bps=fee_bps)
         without_fee = pool_amount(side, q, snap.base, snap.settlement, fee_bps=0)
         embedded = {
             "costId": "pool-fee",

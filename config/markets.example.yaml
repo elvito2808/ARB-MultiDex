@@ -13,7 +13,8 @@ real_markets:
     rpc_endpoints: [https://mainnet.hashio.io/api]
     pool: "0xdB34c1Ef944883f0e5A2fC18B6C1978B088bD31d"
     max_age_ms: 5000
-    pool_fee_bps: 30 # configured SaucerSwap V1 pricing assumption
+    pool_fee_bps: 30 # diagnostic-only SaucerSwap V1 pricing assumption
+    fee_evidence_source: null # requires a separately injected trusted fee lookup
     # Supply verified buy_tinybars, sell_tinybars and reference for the intended route.
     gas_bound: null
     # Supply a trusted source ID and an authenticated/time-bound rate_lookup in S4.
@@ -23,8 +24,9 @@ real_markets:
     base_scale: 8
     settlement_scale: 6
     max_age_ms: 5000
-    # Set an explicit settlement-asset fee assumption for the intended account/route.
+    # Optional diagnostic-only settlement-asset fee assumption.
     settlement_fee_bps: null
+    fee_evidence_source: null # requires a separately injected trusted fee lookup
 
 # These entries are only for explicit offline fixtures via quotes.config.build_market.
 offline_fixtures:

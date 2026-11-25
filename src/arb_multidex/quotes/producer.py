@@ -65,10 +65,12 @@ class QuoteConfig:
 
 
 class QuoteProducer:
-    def __init__(self, feed, config, fees):
+    def __init__(self, feed, config, fees, *, price=None, check_venue_fee=None):
         if not isinstance(fees, feed.policy_type):
             raise TypeError("fee policy does not cover this market")
         self.feed, self.config, self.fees = feed, config, fees
+        self.price = feed.price if price is None else price
+        self.check_venue_fee = check_venue_fee
 
     def request(self, request_id, side):
         """Build the canonical request for this binding. The caller owns request IDs."""
@@ -128,7 +130,7 @@ class QuoteProducer:
         observed = UNIX_EPOCH + timedelta(milliseconds=snap.observed_ms)
         side, q = req["side"], cfg.base_units
         try:
-            gross, embedded = feed.price(snap, side, q)
+            gross, embedded = self.price(snap, side, q)
         except MarketError as exc:
             if exc.code == "FEE_UNAVAILABLE":
                 with feed.state_lock:
@@ -159,6 +161,8 @@ class QuoteProducer:
         feed.validate_observation(snap, now)
         stale = now - snap.observed_ms >= self.config.max_age_ms
         try:
+            if self.check_venue_fee is not None:
+                self.check_venue_fee(now)
             separate = self.fees.costs(feed, gross, now, evidence)
         except MarketError:
             if stale:

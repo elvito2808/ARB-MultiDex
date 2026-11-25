@@ -5,7 +5,7 @@ import pytest
 import yaml
 
 from arb_multidex.connections.http import TransportError
-from arb_multidex.connections.real_markets import GAS_ASSET, RealMarkets
+from arb_multidex.connections.real_markets import GAS_ASSET, RealMarkets, VenueFee
 from arb_multidex.contracts import PAIR_ABI, TOKEN_ABI
 from arb_multidex.dex.saucerswap import FACTORY, USDC, WHBAR
 from arb_multidex.opportunity import Direction, Rate
@@ -15,6 +15,7 @@ NOW = 1795554000000
 POOL = "0x" + "12" * 20
 ENDPOINT = "https://relay.invalid/api"
 SOURCE = "test/trusted-hbar-usdc"
+FEE_SOURCES = {"dex": "test/pool-fees", "kucoin": "test/spot-fees"}
 BASE, SETTLEMENT = 100_000 * 10**8, 5_000 * 10**6
 
 
@@ -31,6 +32,7 @@ class PublicTransports:
         self.ask_size = "251"
         self.block_time = NOW
         self.base_reserve = BASE
+        self.settlement_reserve = SETTLEMENT
 
     def rpc(self, url, *, method, body, timeout):
         assert url == ENDPOINT and method == "POST"
@@ -51,7 +53,7 @@ class PublicTransports:
                 (POOL, PAIR_ABI["token1"].selector): (int(WHBAR, 16),),
                 (POOL, PAIR_ABI["factory"].selector): (int(FACTORY, 16),),
                 (POOL, PAIR_ABI["getReserves"].selector): (
-                    SETTLEMENT, self.base_reserve, NOW // 1000,
+                    self.settlement_reserve, self.base_reserve, NOW // 1000,
                 ),
                 (USDC, TOKEN_ABI["decimals"].selector): (6,),
                 (WHBAR, TOKEN_ABI["decimals"].selector): (8,),
@@ -76,19 +78,42 @@ def gas_rate(feed, snap, side, quantity):
     return "test/rate/1", Rate(SOURCE, GAS_ASSET, 8, USDC, 6, 1, 2000, NOW - 10, NOW + 500)
 
 
+def fixture_fee_lookup(req):
+    dex = req["sourceId"].startswith("hedera/")
+    venue = "dex" if dex else "kucoin"
+    return VenueFee(
+        FEE_SOURCES[venue], f"test/{venue}/fees/{req['side']}", req["sourceId"],
+        "configured-venue-fees-and-gas-v1", req["side"], USDC if dex else "kucoin/USDT",
+        25 if dex else 10, NOW - 10, NOW + 10_000,
+    )
+
+
 def provider(
-    transports, *, rate_lookup=gas_rate, spot_fee=10, pool_fee=25, settlement_scale=6, volume=250
+    transports, *, rate_lookup=gas_rate, spot_fee=10, pool_fee=25,
+    settlement_scale=6, volume=250, fee_lookup=fixture_fee_lookup, missing_fee_for=None,
 ):
     path = Path(__file__).resolve().parents[3] / "config" / "markets.example.yaml"
     config = yaml.safe_load(path.read_text())["real_markets"]
     config.update(one_to_one_settlements=True, base_units=volume * 10**8)
     config["dex"].update(
         rpc_endpoints=[ENDPOINT], pool=POOL, pool_fee_bps=pool_fee, gas_rate_source=SOURCE,
+        fee_evidence_source=FEE_SOURCES["dex"],
         gas_bound={"buy_tinybars": 100001, "sell_tinybars": 80000, "reference": "test/route-1"},
     )
-    config["kucoin"].update(settlement_fee_bps=spot_fee, settlement_scale=settlement_scale)
+    config["kucoin"].update(
+        settlement_fee_bps=spot_fee, settlement_scale=settlement_scale,
+        fee_evidence_source=FEE_SOURCES["kucoin"],
+    )
+
+    def lookup(req):
+        venue = "dex" if req["sourceId"].startswith("hedera/") else "kucoin"
+        if missing_fee_for == venue:
+            return None
+        return fee_lookup(req)
+
     return RealMarkets(
         config, clock=lambda: transports.now, rate_lookup=rate_lookup,
+        fee_lookup=None if fee_lookup is None else lookup,
         rpc_options={"http": transports.rpc, "attempts": 1},
         kucoin_options={"http": transports.kucoin},
     )
@@ -118,7 +143,7 @@ def test_missing_pool_fee_respects_quote_error_precedence(age_ms, rpc_unavailabl
 
     transports = UnavailableRPC() if rpc_unavailable else PublicTransports()
     transports.now = transports.block_time + age_ms
-    markets = provider(transports, pool_fee=None)
+    markets = provider(transports, pool_fee=None, missing_fee_for="dex")
     report = markets.inspect("dex")
     assert {side: details["error"] for side, details in report["sides"].items()} == {
         "BUY": expected, "SELL": expected,
@@ -133,7 +158,7 @@ def test_insufficient_buy_reserve_precedes_missing_pool_fee_and_age(age_ms, sell
     transports = PublicTransports()
     transports.base_reserve = 249 * 10**8
     transports.now = transports.block_time + age_ms
-    markets = provider(transports, pool_fee=None)
+    markets = provider(transports, pool_fee=None, missing_fee_for="dex")
 
     report = markets.inspect("dex")
 
@@ -143,9 +168,84 @@ def test_insufficient_buy_reserve_precedes_missing_pool_fee_and_age(age_ms, sell
     assert not report["sourceReady"]
 
 
+@pytest.mark.parametrize("age_ms", [4999, 5000, 5001])
+def test_buy_settlement_capacity_precedes_missing_fee_and_age(age_ms):
+    transports = PublicTransports()
+    transports.settlement_reserve = 2**112 - 1
+    transports.now += age_ms
+    batch = provider(transports, pool_fee=None, missing_fee_for="dex").collect()
+
+    assert batch.calls[Direction.BUY_DEX, "BUY"].response["code"] == "SOURCE_UNAVAILABLE"
+    sell = batch.calls[Direction.BUY_KUCOIN, "SELL"].response
+    assert sell["code"] == ("FEE_UNAVAILABLE" if age_ms < 5000 else "STALE_QUOTE")
+
+
+def test_configured_estimates_without_evidence_are_diagnostic_only():
+    batch = provider(PublicTransports(), pool_fee=0, spot_fee=10, fee_lookup=None).collect()
+
+    assert all(call.response["code"] == "FEE_UNAVAILABLE" for call in batch.calls.values())
+    assert not batch.fee_deadlines
+    for report in batch.observations.values():
+        assert report["observedAt"] and report["availableDepth"]
+        assert report["fees"]["basis"] == "CONFIGURED_ESTIMATE"
+        assert all(side["grossPrice"] and "feeEvidence" not in side
+                   for side in report["sides"].values())
+
+
+@pytest.mark.parametrize("change", [
+    {"market": "wrong/pool"}, {"source": "test/untrusted"}, {"side": "unknown"},
+    {"fee_policy_id": "other/account"}, {"settlement_asset": "wrong/asset"},
+    {"reference": ""}, {"reference": "mock/example"}, {"basis_points": True},
+    {"basis_points": 10_000}, {"valid_until_ms": NOW}, {"observed_ms": NOW + 1},
+])
+def test_fee_evidence_must_match_the_binding_and_be_current(change):
+    def lookup(req):
+        return replace(fixture_fee_lookup(req), **change)
+
+    batch = provider(PublicTransports(), fee_lookup=lookup).collect()
+    assert all(call.response["code"] == "FEE_UNAVAILABLE" for call in batch.calls.values())
+
+
+def test_one_unverified_side_does_not_change_the_other_quote():
+    def lookup(req):
+        if req["side"] == "SELL":
+            return {"verified": True, "basis_points": 10}
+        return fixture_fee_lookup(req)
+
+    batch = provider(PublicTransports(), fee_lookup=lookup).collect()
+    for direction in Direction:
+        assert batch.calls[direction, "BUY"].response["status"] == "OK"
+        assert batch.calls[direction, "SELL"].response["code"] == "FEE_UNAVAILABLE"
+
+
+def test_fee_expiry_is_checked_at_publication_and_when_s2_reuses_the_batch():
+    transports = PublicTransports()
+
+    def short_lived(req):
+        return replace(fixture_fee_lookup(req), valid_until_ms=NOW + 1)
+
+    markets = provider(transports, fee_lookup=short_lived)
+    batch = markets.collect()
+    assert all(call.response["status"] == "OK" for call in batch.calls.values())
+    transports.now += 1
+    with markets.context(batch) as context:
+        for call in batch.calls.values():
+            assert validate(call, markets.relationship, context).code == "SOURCE_UNAVAILABLE"
+
+    transports = PublicTransports()
+
+    def slow_gas(*args):
+        transports.now += 1
+        return gas_rate(*args)
+
+    batch = provider(transports, fee_lookup=short_lived, rate_lookup=slow_gas).collect()
+    assert all(call.response["code"] == "FEE_UNAVAILABLE" for call in batch.calls.values())
+    assert not batch.observations["dex"]["sourceReady"]
+
+
 def test_both_directions_one_verified_snapshot_per_market_and_exact_costs():
     transports = PublicTransports()
-    markets = provider(transports)
+    markets = provider(transports, pool_fee=30, spot_fee=None)
     batch = markets.collect()
     assert batch.provenance == "REAL"
     assert len(batch.calls) == 4
@@ -173,6 +273,9 @@ def test_both_directions_one_verified_snapshot_per_market_and_exact_costs():
     assert legs[Direction.BUY_KUCOIN, "BUY"].settlement.units == 13_763_750
     assert legs[Direction.BUY_DEX, "SELL"].settlement.units == 13_486_500
     assert all(leg.base.units == q for leg in legs.values())
+    assert all(side["feeEvidence"]["source"] == FEE_SOURCES[venue]
+               for venue, report in batch.observations.items()
+               for side in report["sides"].values())
     assert all(leg.epoch == batch.observations[venue]["connectionEpoch"]
                for venue, leg in (("dex", buy_dex), ("dex", sell_dex)))
 
@@ -218,7 +321,7 @@ def test_gas_missing_or_invalid_fails_even_with_public_prices(defect):
 def test_bad_chain_and_unknown_spot_fee_are_independent_failures():
     transports = PublicTransports()
     transports.chain = 1
-    markets = provider(transports, spot_fee=None)
+    markets = provider(transports, spot_fee=None, missing_fee_for="kucoin")
     batch = markets.collect()
     assert transports.methods == ["eth_chainId"]
     assert "wrong Hedera chain ID" in batch.observations["dex"]["error"]
