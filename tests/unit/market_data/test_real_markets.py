@@ -73,20 +73,53 @@ def gas_rate(feed, snap, side, quantity):
     return "test/rate/1", Rate(SOURCE, GAS_ASSET, 8, USDC, 6, 1, 2000, NOW - 10, NOW + 500)
 
 
-def provider(transports, *, rate_lookup=gas_rate, spot_fee=10, volume=250):
+def provider(
+    transports, *, rate_lookup=gas_rate, spot_fee=10, pool_fee=25, settlement_scale=6, volume=250
+):
     path = Path(__file__).resolve().parents[3] / "config" / "markets.example.yaml"
     config = yaml.safe_load(path.read_text())["real_markets"]
     config.update(one_to_one_settlements=True, base_units=volume * 10**8)
     config["dex"].update(
-        rpc_endpoints=[ENDPOINT], pool=POOL, pool_fee_bps=25, gas_rate_source=SOURCE,
+        rpc_endpoints=[ENDPOINT], pool=POOL, pool_fee_bps=pool_fee, gas_rate_source=SOURCE,
         gas_bound={"buy_tinybars": 100001, "sell_tinybars": 80000, "reference": "test/route-1"},
     )
-    config["kucoin"]["settlement_fee_bps"] = spot_fee
+    config["kucoin"].update(settlement_fee_bps=spot_fee, settlement_scale=settlement_scale)
     return RealMarkets(
         config, clock=lambda: transports.now, rate_lookup=rate_lookup,
         rpc_options={"http": transports.rpc, "attempts": 1},
         kucoin_options={"http": transports.kucoin},
     )
+
+
+def test_reference_market_rejects_wrong_kucoin_settlement_scale():
+    transports = PublicTransports()
+    with pytest.raises(ValueError, match="USDT settlement scale 6"):
+        provider(transports, settlement_scale=5)
+    assert not transports.methods
+
+
+@pytest.mark.parametrize(
+    ("age_ms", "rpc_unavailable", "expected"),
+    [
+        (4999, False, "FEE_UNAVAILABLE"),
+        (5000, False, "STALE_QUOTE"),
+        (5001, False, "STALE_QUOTE"),
+        (-1, False, "INVALID_QUOTE"),
+        (5000, True, "SOURCE_UNAVAILABLE"),
+    ],
+)
+def test_missing_pool_fee_respects_quote_error_precedence(age_ms, rpc_unavailable, expected):
+    class UnavailableRPC(PublicTransports):
+        def rpc(self, *args, **kwargs):
+            raise TransportError("RPC unavailable")
+
+    transports = UnavailableRPC() if rpc_unavailable else PublicTransports()
+    transports.now = transports.block_time + age_ms
+    markets = provider(transports, pool_fee=None)
+    report = markets.inspect("dex")
+    assert {side: details["error"] for side, details in report["sides"].items()} == {
+        "BUY": expected, "SELL": expected,
+    }
 
 
 def test_both_directions_one_verified_snapshot_per_market_and_exact_costs():

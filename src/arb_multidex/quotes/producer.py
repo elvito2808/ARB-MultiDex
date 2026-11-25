@@ -127,7 +127,18 @@ class QuoteProducer:
             feed.validate_observation(snap, feed.now())
         observed = UNIX_EPOCH + timedelta(milliseconds=snap.observed_ms)
         side, q = req["side"], cfg.base_units
-        gross, embedded = feed.price(snap, side, q)
+        try:
+            gross, embedded = feed.price(snap, side, q)
+        except MarketError as exc:
+            if exc.code == "FEE_UNAVAILABLE":
+                with feed.state_lock:
+                    if generation != feed.epoch:
+                        raise invalid("connection changed before publication")
+                    now = feed.now()
+                    feed.validate_observation(snap, now)
+                    if now - snap.observed_ms >= cfg.max_age_ms:
+                        raise MarketError("STALE_QUOTE", "expired observation") from exc
+            raise
         if type(gross) is not int or not 0 < gross <= MAX_UNITS:
             raise invalid("unrepresentable gross")
         try:

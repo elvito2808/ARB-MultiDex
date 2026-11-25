@@ -94,6 +94,8 @@ class RealMarkets:
         dex, spot = config["dex"], config["kucoin"]
         if spot["symbol"] != "HBAR-USDT" or spot["base_scale"] != 8:
             raise ValueError("expected KuCoin HBAR-USDT with HBAR scale 8")
+        if type(spot["settlement_scale"]) is not int or spot["settlement_scale"] != 6:
+            raise ValueError("expected KuCoin HBAR-USDT with USDT settlement scale 6")
         self.clock = clock
         self.dex = SaucerSwap(
             ManagedRPC(dex["rpc_endpoints"], **(rpc_options or {})),
