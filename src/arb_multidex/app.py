@@ -1,4 +1,4 @@
-"""Run offline quote, admission, execution, and recovery cycles."""
+"""Run quote, admission, execution, and recovery cycles."""
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -170,7 +170,7 @@ class Application:
         config = self.engine.workers[worker]
         report = {
             "worker_id": worker, "relationship_id": worker, "mode": "SIMULATION",
-            "market_source_mode": "MOCK", "scenario": self.scenario,
+            "market_source_mode": self.markets.provenance, "scenario": self.scenario,
             "real_orders": 0, "blockchain_transactions": 0,
             "base_volume_hbar": decimal_amount(config.volume.units, config.volume.scale),
             "minimum_net_profit_usdt": decimal_amount(
@@ -195,10 +195,17 @@ def open_application(configs, state_dir, scenario, stream):
     workers = tuple(load_owner(path) for path in configs)
     if not 1 <= len(workers) <= 3 or len({w.relationship_id for w in workers}) != len(workers):
         raise ValueError("configure one to three distinct workers")
-    markets = MockMarkets(scenario)
+    with open_runtime(workers, state_dir, MockMarkets(scenario), scenario, stream) as app:
+        yield app
+
+
+@contextmanager
+def open_runtime(workers, state_dir, markets, scenario, stream, *, journal_prefix=""):
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
-    s2, s3 = (state_dir / name for name in ("opportunities.sqlite3", "execution.sqlite3"))
+    s2, s3 = (
+        state_dir / (journal_prefix + name) for name in ("opportunities.sqlite3", "execution.sqlite3")
+    )
     with ExitStack() as stack:
         # Serialize commands and first-time journal creation for this directory.
         lock = stack.enter_context((state_dir / ".runtime.lock").open("a"))
@@ -209,4 +216,5 @@ def open_application(configs, state_dir, scenario, stream):
         stack.callback(guard.close)
         engine = SimulationEngine(s3, workers, guard=guard, clock=markets.clock)
         stack.callback(engine.close)
-        yield Application(engine, markets, EventLog(stream), scenario)
+        log = EventLog(stream, market_source_mode=markets.provenance)
+        yield Application(engine, markets, log, scenario)

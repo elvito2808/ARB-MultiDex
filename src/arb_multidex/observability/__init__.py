@@ -18,8 +18,9 @@ FIELDS = frozenset({
 class EventLog:
     """Accept only named, runtime-produced fields. Never serialize raw inputs or exceptions."""
 
-    def __init__(self, stream):
+    def __init__(self, stream, *, market_source_mode="MOCK"):
         self.stream = stream
+        self.market_source_mode = market_source_mode
 
     def emit(self, event, worker, lifecycle_state, *, execution_id=None, error=None, **fields):
         record = {
@@ -27,7 +28,7 @@ class EventLog:
             "event": event,
             "worker_id": worker,
             "relationship_id": worker,
-            "market_source_mode": "MOCK",
+            "market_source_mode": self.market_source_mode,
             "mode": "SIMULATION",
             "simulated": True,
             "lifecycle_state": lifecycle_state,

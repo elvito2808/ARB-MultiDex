@@ -127,6 +127,9 @@ class RealMarkets:
     expiry. Use an opaque, non-secret reference. Configured bps are diagnostics.
     """
 
+    provenance = "REAL"
+    gas_basis = "CONFIGURED_UPPER_BOUND"
+
     def __init__(
         self, config, *, clock=utc_ms, rate_lookup=None, fee_lookup=None,
         rpc_options=None, kucoin_options=None,
@@ -253,17 +256,22 @@ class RealMarkets:
             if not fee.current(now):
                 raise fee_error()
 
+        return self._quote_at_bps(
+            producer, venue, req, observation, remember, fee.basis_points, check_venue_fee,
+        ), fee
+
+    def _quote_at_bps(self, producer, venue, req, observation, remember, bps, check=None):
         price = None
         policy = producer.fees
         if venue == "dex":
             def price(snap, side, quantity):
-                return self.dex.price_with_fee(snap, side, quantity, fee.basis_points)
+                return self.dex.price_with_fee(snap, side, quantity, bps)
         else:
-            policy = SpotFeePolicy(fee.basis_points)
+            policy = SpotFeePolicy(bps)
         scoped = QuoteProducer(
-            producer.feed, producer.config, policy, price=price, check_venue_fee=check_venue_fee,
+            producer.feed, producer.config, policy, price=price, check_venue_fee=check,
         )
-        return scoped.quote(req, observation=observation, on_gas=remember), fee
+        return scoped.quote(req, observation=observation, on_gas=remember)
 
     def _requests(self):
         requests = {venue: {} for venue in self.feeds}
@@ -278,7 +286,7 @@ class RealMarkets:
         producer = self.producers[venue]
         feed, cfg = producer.feed, producer.config
         diagnostic = {
-            "market": venue, "source": feed.source_id, "provenance": "REAL",
+            "market": venue, "source": feed.source_id, "provenance": self.provenance,
             "baseVolume": str(Fraction(cfg.base_units, 10**feed.base_scale)),
             "observedAt": None, "availableDepth": None, "sides": {},
         }
@@ -381,16 +389,12 @@ class RealMarkets:
                 costs=reply["includedCosts"], settlementUnits=reply["settlementUnits"],
                 grossSettlementUnits=reply["grossSettlementUnits"],
                 grossPrice=self._gross_price(producer, int(reply["grossSettlementUnits"])),
-                feeEvidence={
-                    "source": fee.source, "reference": fee.reference,
-                    "basisPoints": fee.basis_points, "observedMs": fee.observed_ms,
-                    "validUntilMs": fee.valid_until_ms,
-                },
+                **self._fee_details(producer, fee),
             )
             for cost in reply["includedCosts"]:
                 if cost["costId"] == "gas":
                     result["gas"] = {
-                        "basis": "CONFIGURED_UPPER_BOUND", "reference": self.bound.reference,
+                        "basis": self.gas_basis, "reference": self.bound.reference,
                         "tinybars": cost["units"], "rateRef": cost["rateRef"],
                         "rateSource": self.rate_source,
                     }
@@ -412,6 +416,13 @@ class RealMarkets:
                 grossPrice=self._gross_price(producer, gross),
             )
         return result
+
+    def _fee_details(self, producer, fee):
+        return {"feeEvidence": {
+            "source": fee.source, "reference": fee.reference,
+            "basisPoints": fee.basis_points, "observedMs": fee.observed_ms,
+            "validUntilMs": fee.valid_until_ms,
+        }}
 
     @staticmethod
     def _gross_price(producer, gross):

@@ -1,3 +1,5 @@
+import io
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,6 +10,7 @@ from arb_multidex.connections.http import TransportError
 from arb_multidex.connections.real_markets import GAS_ASSET, RealMarkets, VenueFee
 from arb_multidex.contracts import PAIR_ABI, TOKEN_ABI
 from arb_multidex.dex.saucerswap import FACTORY, USDC, WHBAR
+from arb_multidex.lifecycle.dry_run import run_dry_run
 from arb_multidex.opportunity import Direction, Rate
 from arb_multidex.opportunity.validation import validate
 
@@ -26,6 +29,10 @@ def words(*values):
 class PublicTransports:
     def __init__(self):
         self.methods = []
+        self.kucoin_requests = []
+        self.bid, self.ask = "0.054", "0.055"
+        self.disconnected = False
+        self.pool = POOL
         self.chain = 295
         self.now = NOW
         self.book_time = NOW
@@ -49,10 +56,10 @@ class PublicTransports:
             call, tag = params
             assert tag == "0x7b"
             fields = {
-                (POOL, PAIR_ABI["token0"].selector): (int(USDC, 16),),
-                (POOL, PAIR_ABI["token1"].selector): (int(WHBAR, 16),),
-                (POOL, PAIR_ABI["factory"].selector): (int(FACTORY, 16),),
-                (POOL, PAIR_ABI["getReserves"].selector): (
+                (self.pool, PAIR_ABI["token0"].selector): (int(USDC, 16),),
+                (self.pool, PAIR_ABI["token1"].selector): (int(WHBAR, 16),),
+                (self.pool, PAIR_ABI["factory"].selector): (int(FACTORY, 16),),
+                (self.pool, PAIR_ABI["getReserves"].selector): (
                     self.settlement_reserve, self.base_reserve, NOW // 1000,
                 ),
                 (USDC, TOKEN_ABI["decimals"].selector): (6,),
@@ -62,15 +69,18 @@ class PublicTransports:
         return {"jsonrpc": "2.0", "id": body["id"], "result": result}
 
     def kucoin(self, url, *, method, timeout):
+        self.kucoin_requests.append((method, url))
         if url.endswith("/bullet-public"):
             assert method == "POST"
             raise TransportError("stream bootstrap unavailable")
         assert method == "GET"
         assert url == "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=HBAR-USDT"
+        if self.disconnected:
+            raise TransportError("offline fixture")
         return {
             "code": "200000",
-            "data": {"time": self.book_time, "bestBid": "0.054", "bestBidSize": "255",
-                     "bestAsk": "0.055", "bestAskSize": self.ask_size},
+            "data": {"time": self.book_time, "bestBid": self.bid, "bestBidSize": "255",
+                     "bestAsk": self.ask, "bestAskSize": self.ask_size},
         }
 
 
@@ -340,3 +350,115 @@ def test_conflicting_gas_rate_reference_invalidates_both_dex_quotes():
     assert not batch.rates
     assert all(side["error"] == "FEE_UNAVAILABLE"
                for side in batch.observations["dex"]["sides"].values())
+
+
+@pytest.fixture
+def dry_run_fixture(tmp_path):
+    sample = Path(__file__).resolve().parents[3] / "config" / "dry-run.example.json"
+    config = json.loads(sample.read_text())
+    config["dry_run"]["rpc_endpoints"] = [ENDPOINT]
+    transports = PublicTransports()
+    transports.pool = config["relationship"]["dex"]["pool"].lower()
+    path = tmp_path / "dry-run.json"
+    state = tmp_path / "state"
+
+    def run():
+        path.write_text(json.dumps(config))
+        return run_dry_run(
+            path, state, io.StringIO(), provenance="FIXTURE", clock=lambda: transports.now,
+            rpc_options={"http": transports.rpc, "attempts": 1},
+            kucoin_options={"http": transports.kucoin},
+        )
+
+    return config, transports, state, run
+
+
+@pytest.mark.parametrize("direction", ["BUY_DEX", "BUY_KUCOIN"])
+def test_real_dry_run_executes_and_reopens_simulated_journal(dry_run_fixture, direction):
+    _, transport, state, run = dry_run_fixture
+    if direction == "BUY_KUCOIN":
+        transport.bid, transport.ask = "0.045", "0.046"
+    report = run()
+    assert report["market_source_mode"] == "FIXTURE"
+    assert all(o["provenance"] == "FIXTURE" for o in report["observations"].values())
+    assert report["cost_basis"] == "ESTIMATED"
+    assert report["status"] == "COMPLETED"
+    assert report["admission"]["direction"] == Direction[direction].value
+    assert all(d["net_profit_usdt"] is not None for d in report["decisions"])
+    assert [attempt["leg"] for attempt in report["attempts"]] == ["DEX", "KUCOIN"]
+    assert [attempt["status"] for attempt in report["attempts"]] == ["SUCCESS", "SUCCESS"]
+    dex_base, _, gas, kucoin_base, _ = [holding["recorded"] for holding in report["after"]]
+    assert gas == "9.90000000"
+    expected_base = ("1250.00000000", "750.00000000")
+    assert (dex_base, kucoin_base) == (
+        expected_base if direction == "BUY_DEX" else expected_base[::-1]
+    )
+    assert (state / "dry-run-execution.sqlite3").is_file()
+    assert (state / "dry-run-opportunities.sqlite3").is_file()
+    transport.bid, transport.ask = "0.050", "0.051"
+    replay = run()
+    assert replay["status"] == "NO_OP"
+    assert replay["before"] == replay["after"] == report["after"]
+    assert replay["worker_status"]["completed_count"] == 1
+    assert report["real_orders"] == report["blockchain_transactions"] == 0
+    assert set(transport.methods) == {"eth_chainId", "eth_getBlockByNumber", "eth_call"}
+    assert {method for method, _ in transport.kucoin_requests} == {"GET", "POST"}
+    assert all(
+        url.endswith("/bullet-public") if method == "POST" else "/market/orderbook/" in url
+        for method, url in transport.kucoin_requests
+    )
+    for observation in report["observations"].values():
+        for side in observation["sides"].values():
+            assert side["feeEstimate"]["basis"] == "ESTIMATED"
+            assert "feeEvidence" not in side
+
+
+@pytest.mark.parametrize("scenario, reason", [
+    ("unprofitable", "BELOW_MINIMUM_NET_PROFIT"), ("stale", "STALE_QUOTE"),
+    ("disconnected", "SOURCE_UNAVAILABLE"), ("illiquid", "SOURCE_UNAVAILABLE"),
+])
+def test_real_dry_run_rejects_invalid_or_unprofitable_markets(dry_run_fixture, scenario, reason):
+    config, transport, _, run = dry_run_fixture
+    if scenario == "unprofitable":
+        transport.bid, transport.ask = "0.050", "0.051"
+    elif scenario == "stale":
+        transport.now += config["dry_run"]["dex_max_age_ms"]
+    elif scenario == "disconnected":
+        transport.disconnected = True
+    else:
+        transport.ask_size = "249"
+    report = run()
+    assert report["status"] == "NO_OP"
+    assert reason in report["reasons"]
+    assert report["before"] == report["after"]
+    assert report["worker_status"]["completed_count"] == 0
+    assert not report.get("attempts")
+    assert report["real_orders"] == report["blockchain_transactions"] == 0
+    if scenario == "illiquid":
+        side = report["observations"]["kucoin"]["sides"]["BUY"]
+        assert side["pricingError"] == "insufficient top-level depth"
+
+
+@pytest.mark.parametrize("name", [
+    "pool_fee_bps", "kucoin_fee_bps", "buy_gas_tinybars", "sell_gas_tinybars",
+    "gas_usdc_atoms_per_hbar",
+])
+def test_real_dry_run_requires_all_estimates(dry_run_fixture, name):
+    config, transport, state, run = dry_run_fixture
+    del config["dry_run"][name]
+    with pytest.raises(ValueError, match=f"MISSING_ESTIMATE: {name}"):
+        run()
+    assert not state.exists()
+    assert not transport.methods and not transport.kucoin_requests
+
+
+@pytest.mark.parametrize("setting, error", [
+    (False, "LIVE_NOT_AUTHORIZED"), ("true", "must be the boolean true"),
+])
+def test_real_dry_run_rejects_live_and_non_boolean_mode(dry_run_fixture, setting, error):
+    config, transport, state, run = dry_run_fixture
+    config["simulation_enabled"] = setting
+    with pytest.raises(ValueError, match=error):
+        run()
+    assert not state.exists()
+    assert not transport.methods and not transport.kucoin_requests
