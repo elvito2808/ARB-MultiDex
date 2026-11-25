@@ -198,3 +198,16 @@ def test_slow_poller_drains_buffered_snapshots_without_refreshing_their_age():
     result = p.quote(p.request("latest", "BUY"))
     assert result["status"] == "OK" and p.feed.route == "websocket"
     assert p.feed.last.observed_ms == clock.now_ms - 100
+
+
+def test_stale_websocket_uses_valid_rest_and_rotates_epoch():
+    p, clock, api, ws = market()
+    p.feed.stream_max_age_ms = 5000
+    ws.snapshot()
+    first = p.quote(p.request("first", "BUY"))
+    clock.now_ms += 5000
+    ws.snapshot()
+    api.time = clock.now_ms
+    second = p.quote(p.request("rest", "BUY"))
+    assert second["status"] == "OK" and p.feed.route == "rest"
+    assert ws.closed and second["connectionEpoch"] != first["connectionEpoch"]
