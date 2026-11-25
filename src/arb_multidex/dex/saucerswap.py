@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from arb_multidex.connections.feed import Feed, invalid, unavailable
 from arb_multidex.connections.rpc import quantity
 from arb_multidex.contracts import PAIR_ABI, TOKEN_ABI
-from arb_multidex.quotes.fees import GasPolicy
+from arb_multidex.quotes.fees import GasPolicy, fee_error
 
 PAIR = "0xdb34c1ef944883f0e5a2fc18b6c1978b088bd31d"
 FACTORY = "0x0000000000000000000000000000000000103780"
@@ -68,8 +68,14 @@ def _header(call, tag):
 class SaucerSwap(Feed):
     policy_type = GasPolicy
 
-    def __init__(self, rpc, **clock_options):
-        super().__init__(SOURCE, WHBAR, USDC, 8, 6, **clock_options)
+    def __init__(self, rpc, *, pool=PAIR, fee_bps=30, **clock_options):
+        if not isinstance(pool, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", pool):
+            raise ValueError("configure a SaucerSwap V1 pool address")
+        if fee_bps is not None and (type(fee_bps) is not int or not 0 <= fee_bps < 10000):
+            raise ValueError("invalid pool fee")
+        self.pool, self.fee_bps = pool.lower(), fee_bps
+        super().__init__(f"hedera/295/saucerswap-v1/{self.pool}", WHBAR, USDC, 8, 6,
+                         **clock_options)
         self.rpc = rpc
 
     def read(self):
@@ -88,12 +94,12 @@ class SaucerSwap(Feed):
                 raise invalid(str(exc)) from exc
 
         for name, expected in (("token0", USDC), ("token1", WHBAR), ("factory", FACTORY)):
-            if get(PAIR, PAIR_ABI[name]) != (expected,):
+            if get(self.pool, PAIR_ABI[name]) != (expected,):
                 raise invalid(f"unexpected pair {name}")
         for token, decimals in ((USDC, 6), (WHBAR, 8)):
             if get(token, TOKEN_ABI["decimals"]) != (decimals,):
                 raise invalid("unexpected token decimals")
-        settlement, base, last_update = get(PAIR, PAIR_ABI["getReserves"])
+        settlement, base, last_update = get(self.pool, PAIR_ABI["getReserves"])
         if not settlement or not base:
             raise invalid("empty pool reserves")
         if _header(call, tag) != (height, digest, observed):
@@ -101,7 +107,16 @@ class SaucerSwap(Feed):
         return Reserves(height, digest, observed, settlement, base, last_update, self.now())
 
     def price(self, snap, side, q):
-        gross = pool_amount(side, q, snap.base, snap.settlement)
+        return self.price_with_fee(snap, side, q, self.fee_bps)
+
+    def price_with_fee(self, snap, side, q, fee_bps):
+        if fee_bps is None:
+            if side == "BUY":
+                # Zero fee gives the minimum possible input. Use it only to reject
+                # a BUY that cannot fit even at this lower bound.
+                pool_amount(side, q, snap.base, snap.settlement, fee_bps=0)
+            raise fee_error()
+        gross = pool_amount(side, q, snap.base, snap.settlement, fee_bps=fee_bps)
         without_fee = pool_amount(side, q, snap.base, snap.settlement, fee_bps=0)
         embedded = {
             "costId": "pool-fee",

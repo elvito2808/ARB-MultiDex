@@ -11,12 +11,16 @@ class TransportError(Exception):
 
 
 def request_json(url, *, method="GET", body=None, timeout=5):
-    payload = None if body is None else json.dumps(body).encode("utf-8")
+    payload = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
     req = Request(
         url,
         data=payload,
         method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "ARB-MultiDex/0.1",
+        },
     )
     try:
         with urlopen(req, timeout=timeout) as response:

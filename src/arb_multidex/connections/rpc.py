@@ -18,6 +18,8 @@ def quantity(raw):
 
 class ManagedRPC:
     def __init__(self, endpoints, *, attempts=2, timeout=5, http=request_json, sleep=time.sleep):
+        if isinstance(endpoints, (str, bytes)):
+            raise TypeError("configure RPC endpoints as a list")
         self.endpoints = tuple(endpoints)
         if not self.endpoints or any(
             urlsplit(url).scheme not in ("https", "http") or not urlsplit(url).hostname
@@ -66,7 +68,9 @@ class ManagedRPC:
                 if quantity(call("eth_chainId", [])) != 295:
                     raise invalid("wrong Hedera chain ID")
                 feed.connected(index)
-                return read(call)
+                result = read(call)
+                self.last_error = None
+                return result
             except (MarketError, TransportError) as exc:
                 self.last_error = str(exc)
                 feed.disconnect()
