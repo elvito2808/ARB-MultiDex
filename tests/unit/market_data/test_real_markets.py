@@ -30,6 +30,7 @@ class PublicTransports:
         self.book_time = NOW
         self.ask_size = "251"
         self.block_time = NOW
+        self.base_reserve = BASE
 
     def rpc(self, url, *, method, body, timeout):
         assert url == ENDPOINT and method == "POST"
@@ -49,7 +50,9 @@ class PublicTransports:
                 (POOL, PAIR_ABI["token0"].selector): (int(USDC, 16),),
                 (POOL, PAIR_ABI["token1"].selector): (int(WHBAR, 16),),
                 (POOL, PAIR_ABI["factory"].selector): (int(FACTORY, 16),),
-                (POOL, PAIR_ABI["getReserves"].selector): (SETTLEMENT, BASE, NOW // 1000),
+                (POOL, PAIR_ABI["getReserves"].selector): (
+                    SETTLEMENT, self.base_reserve, NOW // 1000,
+                ),
                 (USDC, TOKEN_ABI["decimals"].selector): (6,),
                 (WHBAR, TOKEN_ABI["decimals"].selector): (8,),
             }
@@ -120,6 +123,24 @@ def test_missing_pool_fee_respects_quote_error_precedence(age_ms, rpc_unavailabl
     assert {side: details["error"] for side, details in report["sides"].items()} == {
         "BUY": expected, "SELL": expected,
     }
+
+
+@pytest.mark.parametrize(
+    ("age_ms", "sell_error"),
+    [(4999, "FEE_UNAVAILABLE"), (5000, "STALE_QUOTE"), (5001, "STALE_QUOTE")],
+)
+def test_insufficient_buy_reserve_precedes_missing_pool_fee_and_age(age_ms, sell_error):
+    transports = PublicTransports()
+    transports.base_reserve = 249 * 10**8
+    transports.now = transports.block_time + age_ms
+    markets = provider(transports, pool_fee=None)
+
+    report = markets.inspect("dex")
+
+    assert report["baseVolume"] == "250"
+    assert report["sides"]["BUY"]["error"] == "SOURCE_UNAVAILABLE"
+    assert report["sides"]["SELL"]["error"] == sell_error
+    assert not report["sourceReady"]
 
 
 def test_both_directions_one_verified_snapshot_per_market_and_exact_costs():

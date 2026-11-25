@@ -108,6 +108,8 @@ class SaucerSwap(Feed):
 
     def price(self, snap, side, q):
         if self.fee_bps is None:
+            if side == "BUY" and q >= snap.base:
+                raise unavailable("insufficient base liquidity")
             raise fee_error()
         gross = pool_amount(side, q, snap.base, snap.settlement, fee_bps=self.fee_bps)
         without_fee = pool_amount(side, q, snap.base, snap.settlement, fee_bps=0)
