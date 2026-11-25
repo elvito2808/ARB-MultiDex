@@ -27,7 +27,7 @@ MAX_AGE_MS = 5000
 RATE_SOURCE = "mock/rate"
 
 
-def load_owner(path):
+def load_owner(path, *, mock_sources=True):
     raw = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     relationship = raw["relationship"]
     if (
@@ -40,11 +40,13 @@ def load_owner(path):
         or raw["minimum_net_profit"]["scale"] != 6
     ):
         raise ValueError("invalid simulation mapping or amount")
-    return WorkerConfig.from_owner(path)
+    return WorkerConfig.from_owner(path, mock_sources=mock_sources)
 
 
 class MockMarkets:
     """Shared S1 feeds. Worker lifecycle operations never disconnect them."""
+
+    provenance = "MOCK"
 
     def __init__(self, scenario):
         self.clock = MockClock(SAMPLE_MS + (MAX_AGE_MS if scenario == "stale" else 0))

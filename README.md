@@ -1,6 +1,65 @@
 # ARB-MultiDex
 
-This Python CLI runs one offline arbitrage simulation cycle per selected worker.
+## Real-market DRY-RUN
+
+From the repository root on Linux or macOS, use Python 3.10 or later:
+
+```bash
+PYTHONPATH=src python3 -B -m arb_multidex dry-run
+```
+
+This command evaluates one cycle using public Hedera Mainnet SaucerSwap V1
+WHBAR/USDC reserves and KuCoin HBAR/USDT order-book data. It quotes BUY and
+SELL at 250 HBAR per venue, then compares both directions against the inclusive
+0.15 USDT threshold. The comparison uses the owner-approved WHBAR/HBAR and
+USDC/USDT 1:1 assumptions. KuCoin pricing requires enough size at the best
+level on the quoted side. Successful simulated execution settles the DEX leg
+first and the KuCoin leg second. Exit status 0 includes a completed cycle with
+`NO_OP`. Read `decisions` and `observations` for market rejection details.
+Invalid configuration exits with status 2.
+
+The default [configuration](config/dry-run.example.json) requires
+`simulation_enabled: true` and `admission_policy: "ESTIMATED_COSTS_DRY_RUN"`.
+Use `--config PATH` to select a copy. The `dry_run` object contains:
+
+| Setting | Example | Meaning |
+| --- | ---: | --- |
+| `rpc_endpoints` | Hashio mainnet | Public Hedera JSON-RPC endpoints in failover order |
+| `dex_max_age_ms` / `kucoin_max_age_ms` | 20000 / 5000 | Exclusive maximum observation ages |
+| `max_skew_ms` | 15000 | Maximum timestamp difference between venues |
+| `pool_fee_bps` | 30 | Estimated pool fee embedded in the constant-product quote |
+| `kucoin_fee_bps` | 10 | Estimated separate fee in USDT |
+| `buy_gas_tinybars` / `sell_gas_tinybars` | 10000000 / 10000000 | Estimated native HBAR gas by DEX side, each 0.1 HBAR |
+| `gas_usdc_atoms_per_hbar` | 50000 | Estimated gas conversion, 0.05 USDC per HBAR |
+
+Every estimate must be supplied explicitly. JSON output labels costs
+`ESTIMATED` and includes each venue's observation time, liquidity, per-HBAR
+prices, gross and net settlement, decision reasons, execution receipts, and
+before/after balances. The command uses public reads and the simulation engine.
+Setting `simulation_enabled` to `false` returns `LIVE_NOT_AUTHORIZED`.
+
+The opening inventory is 1,000 WHBAR and 500 USDC on the DEX and 1,000 HBAR and
+500 USDT on KuCoin. Set `initial_balances.dex.HBAR.units` (tinybars as a quoted
+integer) before the first run to change the default 10 simulated HBAR for gas.
+Use the same `--state-dir PATH` (default `.arb-multidex-dry-run`) on subsequent
+runs to retain simulated balances and the execution journal. Keep
+`dry-run-opportunities.sqlite3` and `dry-run-execution.sqlite3` together.
+A fresh state directory starts a new simulation. If the optional
+`websockets==16.0` dependency is installed, the provider tries KuCoin public
+WebSocket depth first. It can also read public REST level 1.
+
+### Strict fee-evidence follow-up
+
+The imported strict market provider still requires independently verified venue
+fee evidence. PR #19 tracks three timing items for future LIVE work. Recheck
+expiry at batch return, enforce the lower validity bound at S2 evaluation, and
+carry the earliest venue fee deadline into admitted leg and request expiry.
+The estimated DRY-RUN uses static configured fees and a gas conversion valid
+only for the DEX observation lifetime. [PR #19](https://github.com/elvito2808/ARB-MultiDex/pull/19)
+
+## Offline fixtures
+
+The offline CLI runs one arbitrage simulation cycle per selected worker.
 Use Python 3.12 on Linux or macOS.
 
 ```bash

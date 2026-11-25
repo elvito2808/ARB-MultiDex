@@ -65,10 +65,12 @@ class QuoteConfig:
 
 
 class QuoteProducer:
-    def __init__(self, feed, config, fees):
+    def __init__(self, feed, config, fees, *, price=None, check_venue_fee=None):
         if not isinstance(fees, feed.policy_type):
             raise TypeError("fee policy does not cover this market")
         self.feed, self.config, self.fees = feed, config, fees
+        self.price = feed.price if price is None else price
+        self.check_venue_fee = check_venue_fee
 
     def request(self, request_id, side):
         """Build the canonical request for this binding. The caller owns request IDs."""
@@ -88,7 +90,7 @@ class QuoteProducer:
             "settlementScale": feed.settlement_scale,
         }
 
-    def quote(self, raw):
+    def quote(self, raw, *, observation=None, on_gas=None):
         """Accept a UTF-8 JSON message or its decoded dict. Return one SIM-01 envelope."""
         rid = source = None
         try:
@@ -104,22 +106,41 @@ class QuoteProducer:
             ):
                 raise invalid("request differs from market binding")
             with self.feed.lock:
-                return self._produce(req)
+                return self._produce(req, observation, on_gas)
         except MarketError as exc:
             code = exc.code
         except (ValueError, TypeError, RecursionError, OverflowError):
             code = "INVALID_QUOTE"
         return {"status": "ERROR", "requestId": rid, "sourceId": source, "code": code}
 
-    def _produce(self, req):
+    def capture(self):
+        """Capture once for a group of requests sharing this feed's lock."""
+        with self.feed.lock:
+            snap = self.feed.read()
+            with self.feed.state_lock:
+                return snap, self.feed.epoch
+
+    def _produce(self, req, observation, on_gas):
         feed, cfg = self.feed, self.config
-        snap = feed.read()
+        snap, generation = observation if observation is not None else self.capture()
         with feed.state_lock:
-            generation = feed.epoch
+            if generation != feed.epoch:
+                raise invalid("connection changed before pricing")
             feed.validate_observation(snap, feed.now())
         observed = UNIX_EPOCH + timedelta(milliseconds=snap.observed_ms)
         side, q = req["side"], cfg.base_units
-        gross, embedded = feed.price(snap, side, q)
+        try:
+            gross, embedded = self.price(snap, side, q)
+        except MarketError as exc:
+            if exc.code == "FEE_UNAVAILABLE":
+                with feed.state_lock:
+                    if generation != feed.epoch:
+                        raise invalid("connection changed before publication")
+                    now = feed.now()
+                    feed.validate_observation(snap, now)
+                    if now - snap.observed_ms >= cfg.max_age_ms:
+                        raise MarketError("STALE_QUOTE", "expired observation") from exc
+            raise
         if type(gross) is not int or not 0 < gross <= MAX_UNITS:
             raise invalid("unrepresentable gross")
         try:
@@ -127,7 +148,10 @@ class QuoteProducer:
         except (OSError, TransportError, MarketError, ValueError, TypeError, KeyError):
             evidence = None
         with feed.state_lock:
-            return self._publish(req, snap, observed, generation, gross, embedded, evidence)
+            result = self._publish(req, snap, observed, generation, gross, embedded, evidence)
+            if on_gas is not None:
+                on_gas(evidence)
+            return result
 
     def _publish(self, req, snap, observed, generation, gross, embedded, evidence):
         feed = self.feed
@@ -137,6 +161,8 @@ class QuoteProducer:
         feed.validate_observation(snap, now)
         stale = now - snap.observed_ms >= self.config.max_age_ms
         try:
+            if self.check_venue_fee is not None:
+                self.check_venue_fee(now)
             separate = self.fees.costs(feed, gross, now, evidence)
         except MarketError:
             if stale:

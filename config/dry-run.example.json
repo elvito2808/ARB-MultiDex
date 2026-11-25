@@ -1,0 +1,83 @@
+{
+  "schema": "simulation-owner-v1",
+  "mode": "SIMULATION",
+  "simulation_notice": "All balances are simulated. No real orders, transfers, approvals or keys.",
+  "relationship": {
+    "id": "hedera-saucerswap-v1-whbar-usdc__kucoin-hbar-usdt",
+    "dex": {
+      "network": "hedera-mainnet",
+      "chainId": 295,
+      "dex": "saucerswap-v1",
+      "pool": "0xdB34c1Ef944883f0e5A2fC18B6C1978B088bD31d",
+      "base": "WHBAR",
+      "settlement": "USDC"
+    },
+    "kucoin": {
+      "symbol": "HBAR-USDT",
+      "base": "HBAR",
+      "settlement": "USDT"
+    },
+    "base_mapping": "WHBAR-to-HBAR explicit 1:1 simulation mapping",
+    "settlement_mapping": "USDC-to-USDT explicit 1:1 simulation policy; not guaranteed market parity"
+  },
+  "quote_base_volume": {
+    "asset": "HBAR-equivalent-WHBAR",
+    "units": "25000000000",
+    "scale": 8
+  },
+  "minimum_net_profit": {
+    "asset": "USDT",
+    "units": "150000",
+    "scale": 6,
+    "comparison": ">="
+  },
+  "initial_balances": {
+    "dex": {
+      "WHBAR": {
+        "units": "100000000000",
+        "scale": 8
+      },
+      "USDC": {
+        "units": "500000000",
+        "scale": 6
+      },
+      "HBAR": {
+        "units": "1000000000",
+        "scale": 8,
+        "provenance": "Configurable opening simulated gas inventory"
+      }
+    },
+    "kucoin": {
+      "HBAR": {
+        "units": "100000000000",
+        "scale": 8
+      },
+      "USDT": {
+        "units": "500000000",
+        "scale": 6
+      }
+    }
+  },
+  "gas_policy": {
+    "mode": "SIMULATED_ONLY",
+    "estimate_required": true,
+    "reject_if_missing": true,
+    "separate_from_initial_hbar_buffer": true,
+    "note": "Use the explicitly configured estimated gas costs and HBAR-to-USDC rate below."
+  },
+  "simulation_enabled": true,
+  "admission_policy": "ESTIMATED_COSTS_DRY_RUN",
+  "dry_run": {
+    "rpc_endpoints": [
+      "https://mainnet.hashio.io/api"
+    ],
+    "dex_max_age_ms": 20000,
+    "kucoin_max_age_ms": 5000,
+    "max_skew_ms": 15000,
+    "pool_fee_bps": 30,
+    "kucoin_fee_bps": 10,
+    "buy_gas_tinybars": 10000000,
+    "sell_gas_tinybars": 10000000,
+    "gas_usdc_atoms_per_hbar": 50000
+  }
+}
